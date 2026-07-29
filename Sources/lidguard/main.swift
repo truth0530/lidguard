@@ -102,8 +102,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// true 이면 시작 비활성 · 해제 활성. 시작 클릭 즉시 true.
     private var isSessionActive = false
-    /// 백그라운드 시작/해제 작업 중 (연속 클릭 방지). 해제 버튼은 active면 유지.
-    private var isBusy = false
+    /// 시작 백그라운드 작업 중 (시작 연타 방지). 해제는 계속 활성.
+    private var isStarting = false
+    /// 해제 백그라운드 작업 중 (해제 연타 방지).
+    private var isStopping = false
     private var sessionClosedMode = false
     /// 로컬 만료 시각 (시스템 파일보다 UI 카운트다운 우선)
     private var localUntilEpoch: Int?
@@ -302,20 +304,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Buttons — 규칙: 세션 켜짐 ⇒ 시작 OFF / 해제 ON
 
-    /// 시작·해제 isEnabled 만 여기서 결정. 다른 코드에서 버튼 enable 직접 건드리지 말 것.
+    /// 시작·해제 isEnabled 정본.
+    /// 규칙: isSessionActive == true  → 시작 OFF, 해제 ON (시작 클릭 즉시)
     func updateButtons() {
         if isSessionActive {
-            // 작동 중: 시작 OFF · 해제 ON (시작 클릭 직후부터 이 규칙)
             startBtn.isEnabled = false
             startBtn.title = "시작"
             startBtn.keyEquivalent = ""
 
-            if isBusy {
-                // 해제 처리 중일 때만 해제 버튼도 잠시 잠금
+            if isStopping {
                 stopBtn.isEnabled = false
                 stopBtn.title = "해제 중…"
                 stopBtn.keyEquivalent = ""
             } else {
+                // 시작 직후·작동 중: 해제만 활성
                 stopBtn.isEnabled = true
                 stopBtn.title = "해제"
                 stopBtn.keyEquivalent = "\r"
@@ -325,20 +327,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             radioOpen.isEnabled = false
             seg.isEnabled = false
         } else {
-            startBtn.isEnabled = !isBusy
-            startBtn.title = isBusy ? "시작 중…" : "시작"
-            startBtn.keyEquivalent = isBusy ? "" : "\r"
+            startBtn.isEnabled = !isStarting && !isStopping
+            startBtn.title = "시작"
+            startBtn.keyEquivalent = (!isStarting && !isStopping) ? "\r" : ""
 
             stopBtn.isEnabled = false
             stopBtn.title = "해제"
             stopBtn.keyEquivalent = ""
 
-            radioClosed.isEnabled = !isBusy
-            radioOpen.isEnabled = !isBusy
-            seg.isEnabled = !isBusy
+            radioClosed.isEnabled = !isStarting && !isStopping
+            radioOpen.isEnabled = !isStarting && !isStopping
+            seg.isEnabled = !isStarting && !isStopping
         }
 
-        // 강제 다시 그리기 (일부 macOS에서 isEnabled 시각 갱신 지연 방지)
         startBtn.needsDisplay = true
         stopBtn.needsDisplay = true
         window?.viewsNeedDisplay = true
@@ -400,7 +401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if left <= 0 {
                 // 타이머 만료 → 세션 종료 (버튼도 시작만 활성)
                 isSessionActive = false
-                isBusy = false
+                isStarting = false
+                isStopping = false
                 sessionClosedMode = false
                 localUntilEpoch = nil
                 deadTicks = 0
@@ -409,7 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 시스템이 죽었고 무제한/잔여 없으면 종료 (오탐 방지: 연속 4틱)
-        if isSessionActive, !isBusy {
+        if isSessionActive, !isStarting, !isStopping {
             let systemActive = sleepDisabled() || caffeinateAlive()
             let remLeft: Int = {
                 if sessionUnlimited { return 1 }
@@ -448,17 +450,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Actions
 
     @objc func startPressed() {
-        // 이미 작동 중이면 무시
         guard !isSessionActive else { return }
-        guard !isBusy else { return }
+        guard !isStarting, !isStopping else { return }
 
         let idx = max(0, min(seg.selectedSegment, durations.count - 1))
         let seconds = durations[idx]
         let closedMode = (radioClosed.state == .on)
 
-        // ★ 클릭 즉시: 시작 OFF / 해제 ON (시스템 결과 기다리지 않음)
+        // ★ 클릭 즉시: 시작 OFF / 해제 ON (시스템·암호 기다리지 않음)
         isSessionActive = true
-        isBusy = true
+        isStarting = true
+        isStopping = false
         sessionClosedMode = closedMode
         sessionUnlimited = (seconds == 0)
         if seconds > 0 {
@@ -467,8 +469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             localUntilEpoch = nil
         }
         deadTicks = 0
-        stopBtn.title = "해제"
-        updateButtons()
+        updateButtons() // start=OFF, stop=ON
         updateStatusVisuals()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -507,15 +508,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             DispatchQueue.main.async {
-                self.isBusy = false
+                self.isStarting = false
                 if ok {
-                    // 세션 유지: 시작 OFF / 해제 ON
                     self.isSessionActive = true
                     if let fileUntil = readUntilEpoch() {
                         self.localUntilEpoch = fileUntil
                     }
                 } else {
-                    // 암호 취소 등 실패 → 준비 상태
                     self.isSessionActive = false
                     self.sessionClosedMode = false
                     self.localUntilEpoch = nil
@@ -529,16 +528,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func stopPressed() {
-        // 세션 중일 때만
         guard isSessionActive else { return }
-        guard !isBusy else { return }
+        guard !isStopping else { return }
 
-        isBusy = true
-        stopBtn.title = "해제 중…"
-        stopBtn.isEnabled = false
-        startBtn.isEnabled = false
-        startBtn.needsDisplay = true
-        stopBtn.needsDisplay = true
+        isStopping = true
+        isStarting = false
+        updateButtons() // 해제 중… 잠금
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -552,7 +547,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 _ = shell("rm -f /tmp/lidguard_until")
             }
             DispatchQueue.main.async {
-                self.isBusy = false
+                self.isStopping = false
+                self.isStarting = false
                 self.isSessionActive = false
                 self.sessionClosedMode = false
                 self.localUntilEpoch = nil
