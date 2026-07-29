@@ -227,14 +227,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             seg.setWidth(58, forSegment: i)
         }
 
-        // 일반 rounded 버튼 — 구버전 AppKit에서도 isEnabled 만으로 확실히 구분
+        // rounded + alpha/tint 로 활성·비활성 시각 구분 (isEnabled 회색만으로는 약함)
         startBtn = NSButton(title: "시작", target: self, action: #selector(startPressed))
         startBtn.bezelStyle = .rounded
         startBtn.setButtonType(.momentaryPushIn)
+        startBtn.font = .systemFont(ofSize: 14, weight: .semibold)
+        startBtn.wantsLayer = true
 
         stopBtn = NSButton(title: "해제", target: self, action: #selector(stopPressed))
         stopBtn.bezelStyle = .rounded
         stopBtn.setButtonType(.momentaryPushIn)
+        stopBtn.font = .systemFont(ofSize: 14, weight: .semibold)
+        stopBtn.wantsLayer = true
 
         let btnRow = NSStackView(views: [startBtn, stopBtn])
         btnRow.orientation = .horizontal
@@ -280,7 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        win.title = "잠자기 방지"
+        win.title = "잠자기 방지  1.0.4"
         win.contentView = content
         win.center()
         win.isReleasedWhenClosed = false
@@ -304,40 +308,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Buttons — 규칙: 세션 켜짐 ⇒ 시작 OFF / 해제 ON
 
-    /// 시작·해제 isEnabled 정본.
-    /// 규칙: isSessionActive == true  → 시작 OFF, 해제 ON (시작 클릭 즉시)
+    /// 시작·해제 isEnabled + **시각 구분** 정본.
+    /// 규칙: isSessionActive → 시작은 어둡게 잠금, 해제만 밝게 활성
     func updateButtons() {
         if isSessionActive {
+            // 시작: 다시 못 누름 + 확실히 어두움 (isEnabled만으로는 구버전 UI에서 구분이 약함)
             startBtn.isEnabled = false
-            startBtn.title = "시작"
+            startBtn.title = "시작됨"
             startBtn.keyEquivalent = ""
+            startBtn.alphaValue = 0.35
+            startBtn.contentTintColor = .tertiaryLabelColor
 
             if isStopping {
                 stopBtn.isEnabled = false
                 stopBtn.title = "해제 중…"
                 stopBtn.keyEquivalent = ""
+                stopBtn.alphaValue = 0.55
+                stopBtn.contentTintColor = .secondaryLabelColor
             } else {
-                // 시작 직후·작동 중: 해제만 활성
                 stopBtn.isEnabled = true
                 stopBtn.title = "해제"
                 stopBtn.keyEquivalent = "\r"
+                stopBtn.alphaValue = 1.0
+                stopBtn.contentTintColor = .systemRed
+                // 강조: 기본 버튼처럼 보이도록
+                window?.defaultButtonCell = stopBtn.cell as? NSButtonCell
             }
 
             radioClosed.isEnabled = false
             radioOpen.isEnabled = false
             seg.isEnabled = false
+            radioClosed.alphaValue = 0.45
+            radioOpen.alphaValue = 0.45
+            seg.alphaValue = 0.45
         } else {
-            startBtn.isEnabled = !isStarting && !isStopping
+            let canStart = !isStarting && !isStopping
+            startBtn.isEnabled = canStart
             startBtn.title = "시작"
-            startBtn.keyEquivalent = (!isStarting && !isStopping) ? "\r" : ""
+            startBtn.keyEquivalent = canStart ? "\r" : ""
+            startBtn.alphaValue = canStart ? 1.0 : 0.45
+            startBtn.contentTintColor = canStart ? .controlAccentColor : .tertiaryLabelColor
+            window?.defaultButtonCell = canStart ? (startBtn.cell as? NSButtonCell) : nil
 
             stopBtn.isEnabled = false
             stopBtn.title = "해제"
             stopBtn.keyEquivalent = ""
+            stopBtn.alphaValue = 0.35
+            stopBtn.contentTintColor = .tertiaryLabelColor
 
-            radioClosed.isEnabled = !isStarting && !isStopping
-            radioOpen.isEnabled = !isStarting && !isStopping
-            seg.isEnabled = !isStarting && !isStopping
+            radioClosed.isEnabled = canStart
+            radioOpen.isEnabled = canStart
+            seg.isEnabled = canStart
+            radioClosed.alphaValue = 1.0
+            radioOpen.alphaValue = 1.0
+            seg.alphaValue = 1.0
         }
 
         startBtn.needsDisplay = true
