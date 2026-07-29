@@ -22,7 +22,6 @@ func shell(_ command: String) -> (Int32, String) {
     return (task.terminationStatus, out.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
-/// Run shell with administrator privileges via osascript (password dialog).
 @discardableResult
 func adminShell(_ command: String) -> Bool {
     let escaped = command
@@ -56,30 +55,21 @@ func caffeinateAlive() -> Bool {
     return code == 0
 }
 
-func remainingSeconds() -> Int? {
+func readUntilEpoch() -> Int? {
     let (_, out) = shell("cat /tmp/lidguard_until 2>/dev/null")
     guard let until = Int(out), until > 0 else { return nil }
-    let left = until - Int(Date().timeIntervalSince1970)
-    return left > 0 ? left : 0
+    return until
 }
 
 func fmtDuration(_ total: Int) -> String {
-    let h = total / 3600
-    let m = (total % 3600) / 60
-    let s = total % 60
+    let t = max(0, total)
+    let h = t / 3600
+    let m = (t % 3600) / 60
+    let s = t % 60
     if h > 0 {
         return String(format: "%d시간 %02d분 %02d초", h, m, s)
     }
     return String(format: "%02d분 %02d초", m, s)
-}
-
-// MARK: - UI phase
-
-enum AppPhase {
-    case idle       // 작동 준비
-    case starting   // 시작 처리 중 (암호 입력 등)
-    case running    // 작동 중
-    case stopping   // 해제 처리 중
 }
 
 // MARK: - AppDelegate
@@ -87,7 +77,6 @@ enum AppPhase {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow?
 
-    /// 큰 상태 배지: 준비 중 / 작동 중
     let phaseBadge = NSTextField(labelWithString: "")
     let statusLabel = NSTextField(labelWithString: "")
     let countdownLabel = NSTextField(labelWithString: "")
@@ -99,7 +88,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var startBtn: NSButton!
     var stopBtn: NSButton!
 
-    /// Duration options in seconds.
     let durations: [Int] = [
         30 * 60,
         60 * 60,
@@ -110,22 +98,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ]
     var timer: Timer?
 
-    /// UI-driven session phase (버튼 상호 작용의 정본).
-    private var phase: AppPhase = .idle
-    /// 뚜껑 닫힘 모드로 켠 세션인지 (해제 시 admin 여부).
+    // MARK: Session state (버튼 상호 작용의 유일한 정본)
+
+    /// true 이면 시작 비활성 · 해제 활성. 시작 클릭 즉시 true.
+    private var isSessionActive = false
+    /// 백그라운드 시작/해제 작업 중 (연속 클릭 방지). 해제 버튼은 active면 유지.
+    private var isBusy = false
     private var sessionClosedMode = false
+    /// 로컬 만료 시각 (시스템 파일보다 UI 카운트다운 우선)
+    private var localUntilEpoch: Int?
+    /// 무제한 세션
+    private var sessionUnlimited = false
+    /// 만료 후 idle 전환용 연속 카운트
+    private var deadTicks = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildUI()
-        // 이전 세션이 살아 있으면 작동 중으로 복원
+        // 이전 세션 복원
         if sleepDisabled() || caffeinateAlive() {
-            phase = .running
+            isSessionActive = true
             sessionClosedMode = sleepDisabled()
+            if let until = readUntilEpoch() {
+                localUntilEpoch = until
+                sessionUnlimited = false
+            } else {
+                sessionUnlimited = true
+                localUntilEpoch = nil
+            }
         }
-        applyPhaseUI()
-        refresh()
+        updateButtons()
+        updateStatusVisuals()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.tick()
         }
     }
 
@@ -133,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    // MARK: UI builders
+    // MARK: UI
 
     private func sectionLabel(_ text: String) -> NSTextField {
         let l = NSTextField(labelWithString: text)
@@ -221,22 +225,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             seg.setWidth(58, forSegment: i)
         }
 
+        // 일반 rounded 버튼 — 구버전 AppKit에서도 isEnabled 만으로 확실히 구분
         startBtn = NSButton(title: "시작", target: self, action: #selector(startPressed))
         startBtn.bezelStyle = .rounded
-        startBtn.controlSize = .large
-        if #available(macOS 11.0, *) {
-            startBtn.hasDestructiveAction = false
-        }
+        startBtn.setButtonType(.momentaryPushIn)
 
         stopBtn = NSButton(title: "해제", target: self, action: #selector(stopPressed))
         stopBtn.bezelStyle = .rounded
-        stopBtn.controlSize = .large
+        stopBtn.setButtonType(.momentaryPushIn)
 
         let btnRow = NSStackView(views: [startBtn, stopBtn])
         btnRow.orientation = .horizontal
         btnRow.spacing = 12
         btnRow.distribution = .fillEqually
-        btnRow.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = NSStackView(views: [
             title,
@@ -285,6 +286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window = win
 
         NSApp.activate(ignoringOtherApps: true)
+        updateButtons()
+        updateStatusVisuals()
     }
 
     @objc func modeChanged(_ sender: NSButton) {
@@ -297,167 +300,142 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Phase UI (버튼·배지 정본)
+    // MARK: Buttons — 규칙: 세션 켜짐 ⇒ 시작 OFF / 해제 ON
 
-    /// 시작/해제 버튼 · 배지 · 입력 잠금을 phase 기준으로 즉시 반영.
-    func applyPhaseUI() {
-        switch phase {
-        case .idle:
-            phaseBadge.stringValue = "●  작동 준비"
-            phaseBadge.textColor = NSColor.secondaryLabelColor
-            statusBox.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-            statusBox.layer?.borderWidth = 1
-            statusBox.layer?.borderColor = NSColor.separatorColor.cgColor
-
-            startBtn.isEnabled = true
-            startBtn.title = "시작"
-            startBtn.keyEquivalent = "\r"
-            if #available(macOS 11.0, *) {
-                startBtn.bezelColor = NSColor.controlAccentColor
-            }
-
-            stopBtn.isEnabled = false
-            stopBtn.title = "해제"
-            stopBtn.keyEquivalent = ""
-            if #available(macOS 11.0, *) {
-                stopBtn.bezelColor = nil
-            }
-
-            radioClosed.isEnabled = true
-            radioOpen.isEnabled = true
-            seg.isEnabled = true
-
-        case .starting:
-            phaseBadge.stringValue = "…  시작 중"
-            phaseBadge.textColor = NSColor.systemBlue
-            statusBox.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.10).cgColor
-            statusBox.layer?.borderWidth = 1
-            statusBox.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.35).cgColor
-
+    /// 시작·해제 isEnabled 만 여기서 결정. 다른 코드에서 버튼 enable 직접 건드리지 말 것.
+    func updateButtons() {
+        if isSessionActive {
+            // 작동 중: 시작 OFF · 해제 ON (시작 클릭 직후부터 이 규칙)
             startBtn.isEnabled = false
-            startBtn.title = "시작 중…"
+            startBtn.title = "시작"
             startBtn.keyEquivalent = ""
-            stopBtn.isEnabled = false
-            stopBtn.title = "해제"
-            stopBtn.keyEquivalent = ""
+
+            if isBusy {
+                // 해제 처리 중일 때만 해제 버튼도 잠시 잠금
+                stopBtn.isEnabled = false
+                stopBtn.title = "해제 중…"
+                stopBtn.keyEquivalent = ""
+            } else {
+                stopBtn.isEnabled = true
+                stopBtn.title = "해제"
+                stopBtn.keyEquivalent = "\r"
+            }
 
             radioClosed.isEnabled = false
             radioOpen.isEnabled = false
             seg.isEnabled = false
+        } else {
+            startBtn.isEnabled = !isBusy
+            startBtn.title = isBusy ? "시작 중…" : "시작"
+            startBtn.keyEquivalent = isBusy ? "" : "\r"
 
-        case .running:
-            let closed = sessionClosedMode || sleepDisabled()
+            stopBtn.isEnabled = false
+            stopBtn.title = "해제"
+            stopBtn.keyEquivalent = ""
+
+            radioClosed.isEnabled = !isBusy
+            radioOpen.isEnabled = !isBusy
+            seg.isEnabled = !isBusy
+        }
+
+        // 강제 다시 그리기 (일부 macOS에서 isEnabled 시각 갱신 지연 방지)
+        startBtn.needsDisplay = true
+        stopBtn.needsDisplay = true
+        window?.viewsNeedDisplay = true
+    }
+
+    func updateStatusVisuals() {
+        if isSessionActive {
+            let closed = sessionClosedMode
             phaseBadge.stringValue = closed ? "●  작동 중 · 뚜껑 닫아도 OK" : "●  작동 중"
-            phaseBadge.textColor = closed ? NSColor.systemOrange : NSColor.systemGreen
-            let tint = closed ? NSColor.systemOrange : NSColor.systemGreen
+            phaseBadge.textColor = closed ? .systemOrange : .systemGreen
+            let tint: NSColor = closed ? .systemOrange : .systemGreen
             statusBox.layer?.backgroundColor = tint.withAlphaComponent(0.12).cgColor
             statusBox.layer?.borderWidth = 1.5
             statusBox.layer?.borderColor = tint.withAlphaComponent(0.55).cgColor
 
-            startBtn.isEnabled = false
-            startBtn.title = "시작"
-            startBtn.keyEquivalent = ""
-            if #available(macOS 11.0, *) {
-                startBtn.bezelColor = nil
+            statusLabel.stringValue = closed
+                ? "뚜껑을 닫아도 깨어 있음"
+                : "뚜껑을 열어둘 때만 깨어 있음"
+            statusLabel.textColor = closed ? .systemOrange : .systemGreen
+
+            if sessionUnlimited {
+                countdownLabel.stringValue = "무제한"
+                countdownLabel.textColor = .labelColor
+            } else if let until = localUntilEpoch ?? readUntilEpoch() {
+                let left = until - Int(Date().timeIntervalSince1970)
+                if left > 0 {
+                    countdownLabel.stringValue = fmtDuration(left)
+                    countdownLabel.textColor = .labelColor
+                } else {
+                    countdownLabel.stringValue = "00분 00초"
+                    countdownLabel.textColor = .secondaryLabelColor
+                }
+            } else {
+                countdownLabel.stringValue = "…"
+                countdownLabel.textColor = .secondaryLabelColor
             }
-
-            stopBtn.isEnabled = true
-            stopBtn.title = "해제"
-            stopBtn.keyEquivalent = "\r" // Enter = 해제
-            if #available(macOS 11.0, *) {
-                stopBtn.bezelColor = NSColor.systemRed
-            }
-
-            radioClosed.isEnabled = false
-            radioOpen.isEnabled = false
-            seg.isEnabled = false
-
-        case .stopping:
-            phaseBadge.stringValue = "…  해제 중"
-            phaseBadge.textColor = NSColor.systemRed
-            statusBox.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.08).cgColor
+        } else {
+            phaseBadge.stringValue = "○  작동 준비"
+            phaseBadge.textColor = .secondaryLabelColor
+            statusBox.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
             statusBox.layer?.borderWidth = 1
-            statusBox.layer?.borderColor = NSColor.systemRed.withAlphaComponent(0.35).cgColor
+            statusBox.layer?.borderColor = NSColor.separatorColor.cgColor
 
-            startBtn.isEnabled = false
-            stopBtn.isEnabled = false
-            stopBtn.title = "해제 중…"
-            stopBtn.keyEquivalent = ""
-
-            radioClosed.isEnabled = false
-            radioOpen.isEnabled = false
-            seg.isEnabled = false
-        }
-    }
-
-    // MARK: Poll
-
-    func refresh() {
-        let disabled = sleepDisabled()
-        let caff = caffeinateAlive()
-        let systemActive = disabled || caff
-        let rem = remainingSeconds()
-
-        // 시스템이 꺼졌는데 UI만 running이면 idle로 복귀 (타이머 만료 등)
-        if phase == .running && !systemActive {
-            // until 파일이 남아 있으면 만료 직후일 수 있음
-            if rem == nil || rem == 0 {
-                phase = .idle
-                sessionClosedMode = false
-                applyPhaseUI()
-            }
-        }
-        // 앱 재실행 등으로 시스템만 살아 있으면 running으로
-        if phase == .idle && systemActive {
-            phase = .running
-            sessionClosedMode = disabled
-            applyPhaseUI()
-        }
-
-        // 상태 문구 + 카운트다운
-        switch phase {
-        case .idle:
             statusLabel.stringValue = "평소처럼 잠자기 · 시작을 누르면 잠자기 방지"
             statusLabel.textColor = .secondaryLabelColor
             countdownLabel.stringValue = "—"
             countdownLabel.textColor = .tertiaryLabelColor
+        }
+    }
 
-        case .starting:
-            statusLabel.stringValue = sessionClosedMode
-                ? "관리자 암호 확인 후 적용합니다…"
-                : "잠자기 방지를 켜는 중…"
-            statusLabel.textColor = .systemBlue
-            countdownLabel.stringValue = "…"
-            countdownLabel.textColor = .systemBlue
-
-        case .running:
-            if disabled || sessionClosedMode {
-                statusLabel.stringValue = "뚜껑을 닫아도 깨어 있음"
-                statusLabel.textColor = .systemOrange
-            } else {
-                statusLabel.stringValue = "뚜껑을 열어둘 때만 깨어 있음"
-                statusLabel.textColor = .systemGreen
-            }
-            if let rem, rem > 0 {
-                countdownLabel.stringValue = fmtDuration(rem)
-                countdownLabel.textColor = .labelColor
-            } else {
-                countdownLabel.stringValue = "무제한"
-                countdownLabel.textColor = .labelColor
-            }
-
-        case .stopping:
-            statusLabel.stringValue = "잠자기 방지를 끄는 중…"
-            statusLabel.textColor = .systemRed
-            countdownLabel.stringValue = "…"
-            countdownLabel.textColor = .systemRed
+    func tick() {
+        // 파일 기준 until 동기화
+        if isSessionActive, !sessionUnlimited, localUntilEpoch == nil {
+            localUntilEpoch = readUntilEpoch()
         }
 
-        // phase 버튼 상태는 starting/stopping 중에는 applyPhaseUI가 유지.
-        // running/idle 은 위에서 동기화했을 수 있으므로 버튼만 한 번 더 맞춤.
-        if phase == .idle || phase == .running {
-            applyPhaseUI()
+        if isSessionActive, !sessionUnlimited, let until = localUntilEpoch {
+            let left = until - Int(Date().timeIntervalSince1970)
+            if left <= 0 {
+                // 타이머 만료 → 세션 종료 (버튼도 시작만 활성)
+                isSessionActive = false
+                isBusy = false
+                sessionClosedMode = false
+                localUntilEpoch = nil
+                deadTicks = 0
+                updateButtons()
+            }
         }
+
+        // 시스템이 죽었고 무제한/잔여 없으면 종료 (오탐 방지: 연속 4틱)
+        if isSessionActive, !isBusy {
+            let systemActive = sleepDisabled() || caffeinateAlive()
+            let remLeft: Int = {
+                if sessionUnlimited { return 1 }
+                if let until = localUntilEpoch {
+                    return until - Int(Date().timeIntervalSince1970)
+                }
+                return 0
+            }()
+            if !systemActive && remLeft <= 0 {
+                deadTicks += 1
+                if deadTicks >= 4 {
+                    isSessionActive = false
+                    sessionClosedMode = false
+                    localUntilEpoch = nil
+                    sessionUnlimited = false
+                    deadTicks = 0
+                    updateButtons()
+                }
+            } else {
+                deadTicks = 0
+            }
+        }
+
+        updateStatusVisuals()
+        // 버튼 상태는 세션 플래그만 따르므로 매 틱 재적용 (외부 간섭 방지)
+        updateButtons()
     }
 
     func bumpGeneration() -> Int {
@@ -470,16 +448,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Actions
 
     @objc func startPressed() {
-        guard phase == .idle else { return }
+        // 이미 작동 중이면 무시
+        guard !isSessionActive else { return }
+        guard !isBusy else { return }
 
-        let idx = max(0, seg.selectedSegment)
-        let seconds = durations[min(idx, durations.count - 1)]
-        let closedMode = radioClosed.state == .on
+        let idx = max(0, min(seg.selectedSegment, durations.count - 1))
+        let seconds = durations[idx]
+        let closedMode = (radioClosed.state == .on)
+
+        // ★ 클릭 즉시: 시작 OFF / 해제 ON (시스템 결과 기다리지 않음)
+        isSessionActive = true
+        isBusy = true
         sessionClosedMode = closedMode
-
-        // 즉시 UI 전환: 시작 비활성 · 상태 = 시작 중
-        phase = .starting
-        applyPhaseUI()
+        sessionUnlimited = (seconds == 0)
+        if seconds > 0 {
+            localUntilEpoch = Int(Date().timeIntervalSince1970) + seconds
+        } else {
+            localUntilEpoch = nil
+        }
+        deadTicks = 0
+        stopBtn.title = "해제"
+        updateButtons()
+        updateStatusVisuals()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -507,35 +497,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let (code, _) = shell(
                         "nohup /usr/bin/caffeinate -i -t \(seconds) >/dev/null 2>&1 & echo $! > /tmp/lidguard_caffeinate.pid; echo $(( $(date +%s) + \(seconds) )) > /tmp/lidguard_until"
                     )
-                    ok = code == 0 && caffeinateAlive()
+                    ok = (code == 0)
                 } else {
                     let (code, _) = shell(
                         "nohup /usr/bin/caffeinate -i >/dev/null 2>&1 & echo $! > /tmp/lidguard_caffeinate.pid; rm -f /tmp/lidguard_until"
                     )
-                    ok = code == 0 && caffeinateAlive()
+                    ok = (code == 0)
                 }
             }
 
             DispatchQueue.main.async {
+                self.isBusy = false
                 if ok {
-                    self.phase = .running
+                    // 세션 유지: 시작 OFF / 해제 ON
+                    self.isSessionActive = true
+                    if let fileUntil = readUntilEpoch() {
+                        self.localUntilEpoch = fileUntil
+                    }
                 } else {
-                    // 암호 취소 등 실패 → 준비 상태로 복귀
-                    self.phase = .idle
+                    // 암호 취소 등 실패 → 준비 상태
+                    self.isSessionActive = false
                     self.sessionClosedMode = false
+                    self.localUntilEpoch = nil
+                    self.sessionUnlimited = false
                     _ = shell("rm -f /tmp/lidguard_until /tmp/lidguard_caffeinate.pid")
                 }
-                self.applyPhaseUI()
-                self.refresh()
+                self.updateButtons()
+                self.updateStatusVisuals()
             }
         }
     }
 
     @objc func stopPressed() {
-        guard phase == .running else { return }
+        // 세션 중일 때만
+        guard isSessionActive else { return }
+        guard !isBusy else { return }
 
-        phase = .stopping
-        applyPhaseUI()
+        isBusy = true
+        stopBtn.title = "해제 중…"
+        stopBtn.isEnabled = false
+        startBtn.isEnabled = false
+        startBtn.needsDisplay = true
+        stopBtn.needsDisplay = true
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -549,10 +552,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 _ = shell("rm -f /tmp/lidguard_until")
             }
             DispatchQueue.main.async {
-                self.phase = .idle
+                self.isBusy = false
+                self.isSessionActive = false
                 self.sessionClosedMode = false
-                self.applyPhaseUI()
-                self.refresh()
+                self.localUntilEpoch = nil
+                self.sessionUnlimited = false
+                self.deadTicks = 0
+                self.updateButtons()
+                self.updateStatusVisuals()
             }
         }
     }
