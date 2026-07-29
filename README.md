@@ -96,4 +96,4 @@ lidguard/
 
 ## License
 
-MIT © 2026 kwangsunglee
+MIT © 2026 carg
