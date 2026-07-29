@@ -1,0 +1,9 @@
+dist/
+.DS_Store
+*.app/
+build/
+DerivedData/
+.idea/
+.vscode/
+*.swp
+*.xcuserstate
