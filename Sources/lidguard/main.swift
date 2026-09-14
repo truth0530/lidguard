@@ -1,549 +1,408 @@
 import AppKit
 import Foundation
 
-// MARK: - Shell helpers
+private let stateDir = "/tmp"
+private let genPath = "\(stateDir)/lidguard_gen"
+private let untilPath = "\(stateDir)/lidguard_until"
+private let stopPath = "\(stateDir)/lidguard_stop"
+private let caffeinatePidPath = "\(stateDir)/lidguard_caffeinate.pid"
+private let watchdogPidPath = "\(stateDir)/lidguard_watchdog.pid"
+private let watchdogLogPath = "\(stateDir)/lidguard_watchdog.log"
+private let startScriptPath = "\(stateDir)/lidguard_start.sh"
+private let watchdogCopyPath = "\(stateDir)/lidguard_watchdog.sh"
+private let daemonizeCopyPath = "\(stateDir)/lidguard_daemonize.py"
 
-@discardableResult
-func shell(_ command: String) -> (Int32, String) {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    task.arguments = ["-c", command]
+private let closedDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
+private let closedLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간"]
+private let openDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, -1]
+private let openLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간", "무한"]
+
+private func shell(_ command: String) -> (Int32, String) {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+    proc.arguments = ["-lc", command]
     let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = pipe
+    proc.standardOutput = pipe
+    proc.standardError = pipe
     do {
-        try task.run()
-        task.waitUntilExit()
+        try proc.run()
+        proc.waitUntilExit()
     } catch {
         return (1, error.localizedDescription)
     }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    let out = String(data: data, encoding: .utf8) ?? ""
-    return (task.terminationStatus, out.trimmingCharacters(in: .whitespacesAndNewlines))
+    return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+}
+
+private func appleQuote(_ value: String) -> String {
+    "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"") + "\""
 }
 
 @discardableResult
-func adminShell(_ command: String) -> Bool {
-    let escaped = command
-        .replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "\"", with: "\\\"")
-    let script = "do shell script \"\(escaped)\" with administrator privileges"
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    task.arguments = ["-e", script]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = pipe
+private func adminShell(_ command: String) -> Bool {
+    let script = "do shell script \(appleQuote(command)) with administrator privileges"
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    proc.arguments = ["-e", script]
+    proc.standardOutput = FileHandle.nullDevice
+    proc.standardError = FileHandle.nullDevice
     do {
-        try task.run()
-        task.waitUntilExit()
-        return task.terminationStatus == 0
+        try proc.run()
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
     } catch {
         return false
     }
 }
 
-func sleepDisabled() -> Bool {
+private func sleepDisabled() -> Bool {
     let (_, out) = shell("pmset -g | awk '/SleepDisabled/{print $2}'")
-    return out == "1"
+    return out.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
 }
 
-func caffeinateAlive() -> Bool {
-    let (code, _) = shell(
-        "test -f /tmp/lidguard_caffeinate.pid && kill -0 $(cat /tmp/lidguard_caffeinate.pid) 2>/dev/null"
-    )
-    return code == 0
+private func caffeinateAlive() -> Bool {
+    let (status, _) = shell("test -f \(caffeinatePidPath) && kill -0 $(cat \(caffeinatePidPath)) 2>/dev/null")
+    return status == 0
 }
 
-func readUntilEpoch() -> Int? {
-    let (_, out) = shell("cat /tmp/lidguard_until 2>/dev/null")
-    guard let until = Int(out), until > 0 else { return nil }
-    return until
+private func watchdogAlive() -> Bool {
+    let (status, _) = shell("test -f \(watchdogPidPath) && kill -0 $(cat \(watchdogPidPath)) 2>/dev/null")
+    return status == 0
 }
 
-func fmtDuration(_ total: Int) -> String {
-    let t = max(0, total)
-    let h = t / 3600
-    let m = (t % 3600) / 60
-    let s = t % 60
-    if h > 0 {
-        return String(format: "%d시간 %02d분 %02d초", h, m, s)
+private func fmtDuration(_ seconds: Int) -> String {
+    let s = max(0, seconds)
+    let h = s / 3600
+    let m = (s % 3600) / 60
+    let sec = s % 60
+    return String(format: "%d시간 %02d분 %02d초", h, m, sec)
+}
+
+private func nowEpoch() -> Int { Int(Date().timeIntervalSince1970) }
+
+private func copyResource(_ name: String, ext: String, to destination: String) {
+    if let bundled = Bundle.main.path(forResource: name, ofType: ext),
+       let data = try? Data(contentsOf: URL(fileURLWithPath: bundled)) {
+        try? data.write(to: URL(fileURLWithPath: destination), options: .atomic)
+        _ = shell("chmod 755 \(destination)")
     }
-    return String(format: "%02d분 %02d초", m, s)
 }
 
-// MARK: - AppDelegate
+private func installHelpers() {
+    copyResource("watchdog", ext: "sh", to: watchdogCopyPath)
+    copyResource("daemonize", ext: "py", to: daemonizeCopyPath)
+}
+
+private func bumpGeneration() -> Int {
+    let (_, out) = shell(
+        "G=$(( $(cat \(genPath) 2>/dev/null || echo 0) + 1 )); echo $G > \(genPath); echo $G"
+    )
+    return Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1
+}
+
+private func writeFile(_ path: String, _ text: String) {
+    try? text.write(toFile: path, atomically: true, encoding: .utf8)
+}
+
+private func killCaffeinate() {
+    _ = shell("test -f \(caffeinatePidPath) && kill $(cat \(caffeinatePidPath)) 2>/dev/null; rm -f \(caffeinatePidPath)")
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow?
-
-    let phaseBadge = NSTextField(labelWithString: "")
-    let statusLabel = NSTextField(labelWithString: "")
-    let countdownLabel = NSTextField(labelWithString: "")
-    var statusBox: NSView!
-
-    var radioClosed: NSButton!
-    var radioOpen: NSButton!
-    var seg: NSSegmentedControl!
-    var startBtn: NSButton!
-    var stopBtn: NSButton!
-
-    let durations: [Int] = [
-        30 * 60,
-        60 * 60,
-        2 * 60 * 60,
-        4 * 60 * 60,
-        8 * 60 * 60,
-        0,
-    ]
+    let phaseBadge = NSTextField(labelWithString: "○  작동 준비")
+    let statusLabel = NSTextField(labelWithString: "평소처럼 잠자기 · 시작을 누르면 잠자기 방지")
+    let countdownLabel = NSTextField(labelWithString: "닫힘 · 열림 시간을 각각 고르세요")
+    var statusBox: NSView?
+    var closedSeg: NSSegmentedControl?
+    var openSeg: NSSegmentedControl?
+    var startBtn: NSButton?
+    var stopBtn: NSButton?
     var timer: Timer?
-
-    // MARK: Session state (버튼 상호 작용의 유일한 정본)
-
-    /// true 이면 시작 비활성 · 해제 활성. 시작 클릭 즉시 true.
     private var isSessionActive = false
-    /// 시작 백그라운드 작업 중 (시작 연타 방지). 해제는 계속 활성.
     private var isStarting = false
-    /// 해제 백그라운드 작업 중 (해제 연타 방지).
     private var isStopping = false
-    private var sessionClosedMode = false
-    /// 로컬 만료 시각 (시스템 파일보다 UI 카운트다운 우선)
-    private var localUntilEpoch: Int?
-    /// 무제한 세션
-    private var sessionUnlimited = false
-    /// 만료 후 idle 전환용 연속 카운트
-    private var deadTicks = 0
+    private var closedUntil: Int?
+    private var openUntil: Int?
+    private var openUnlimited = false
+    private var needsAdmin = false
+    private var activity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
         buildUI()
-        // 이전 세션 복원
-        if sleepDisabled() || caffeinateAlive() {
-            isSessionActive = true
-            sessionClosedMode = sleepDisabled()
-            if let until = readUntilEpoch() {
-                localUntilEpoch = until
-                sessionUnlimited = false
-            } else {
-                sessionUnlimited = true
-                localUntilEpoch = nil
-            }
-        }
-        updateButtons()
-        updateStatusVisuals()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        restoreIfNeeded()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        RunLoop.main.add(timer!, forMode: .common)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
 
-    // MARK: UI
-
-    private func sectionLabel(_ text: String) -> NSTextField {
-        let l = NSTextField(labelWithString: text)
-        l.font = .systemFont(ofSize: 11, weight: .semibold)
-        l.textColor = .secondaryLabelColor
-        return l
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isSessionActive || sleepDisabled() || caffeinateAlive() {
+            stopSession()
+            isSessionActive = false
+            endActivity()
+        }
+        return .terminateNow
     }
 
-    private func separator() -> NSBox {
-        let b = NSBox()
-        b.boxType = .separator
-        b.translatesAutoresizingMaskIntoConstraints = false
-        return b
-    }
-
-    private func makeStatusBox() -> NSView {
-        let box = NSView()
-        box.wantsLayer = true
-        box.layer?.cornerRadius = 10
-        box.layer?.masksToBounds = true
-        box.translatesAutoresizingMaskIntoConstraints = false
-
-        phaseBadge.font = .systemFont(ofSize: 12, weight: .bold)
-        phaseBadge.alignment = .center
-        phaseBadge.translatesAutoresizingMaskIntoConstraints = false
-
-        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        statusLabel.alignment = .center
-        statusLabel.lineBreakMode = .byWordWrapping
-        statusLabel.maximumNumberOfLines = 2
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        countdownLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
-        countdownLabel.alignment = .center
-        countdownLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let stack = NSStackView(views: [phaseBadge, statusLabel, countdownLabel])
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
-            stack.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14),
-            stack.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
-            box.heightAnchor.constraint(greaterThanOrEqualToConstant: 96),
-        ])
-        return box
+    func applicationWillTerminate(_ notification: Notification) {
+        if isSessionActive || sleepDisabled() {
+            stopSession()
+        }
+        endActivity()
+        timer?.invalidate()
     }
 
     func buildUI() {
-        let content = NSView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-
-        let title = NSTextField(labelWithString: "잠자기 방지")
-        title.font = .systemFont(ofSize: 18, weight: .bold)
-
-        statusBox = makeStatusBox()
-
-        let modeHeader = sectionLabel("모드")
-        radioClosed = NSButton(
-            radioButtonWithTitle: "뚜껑을 닫아도 깨어 있기  (관리자 암호 필요)",
-            target: self,
-            action: #selector(modeChanged(_:))
-        )
-        radioOpen = NSButton(
-            radioButtonWithTitle: "뚜껑을 열어둘 때만 깨어 있기",
-            target: self,
-            action: #selector(modeChanged(_:))
-        )
-        radioOpen.state = .on
-
-        let durHeader = sectionLabel("유지 시간  ·  지나면 자동 해제")
-        let labels = durations.map { sec -> String in
-            if sec == 0 { return "무제한" }
-            if sec < 3600 { return "\(sec / 60)분" }
-            return "\(sec / 3600)시간"
-        }
-        seg = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: nil, action: nil)
-        seg.segmentStyle = .rounded
-        seg.selectedSegment = 1
-        for i in 0..<labels.count {
-            seg.setWidth(58, forSegment: i)
-        }
-
-        // rounded + alpha/tint 로 활성·비활성 시각 구분 (isEnabled 회색만으로는 약함)
-        startBtn = NSButton(title: "시작", target: self, action: #selector(startPressed))
-        startBtn.bezelStyle = .rounded
-        startBtn.setButtonType(.momentaryPushIn)
-        startBtn.font = .systemFont(ofSize: 14, weight: .semibold)
-        startBtn.wantsLayer = true
-
-        stopBtn = NSButton(title: "해제", target: self, action: #selector(stopPressed))
-        stopBtn.bezelStyle = .rounded
-        stopBtn.setButtonType(.momentaryPushIn)
-        stopBtn.font = .systemFont(ofSize: 14, weight: .semibold)
-        stopBtn.wantsLayer = true
-
-        let btnRow = NSStackView(views: [startBtn, stopBtn])
-        btnRow.orientation = .horizontal
-        btnRow.spacing = 12
-        btnRow.distribution = .fillEqually
-
-        let stack = NSStackView(views: [
-            title,
-            statusBox,
-            separator(),
-            modeHeader,
-            radioClosed,
-            radioOpen,
-            separator(),
-            durHeader,
-            seg,
-            btnRow,
-        ])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.setCustomSpacing(12, after: statusBox)
-        stack.setCustomSpacing(14, after: radioOpen)
-        stack.setCustomSpacing(16, after: seg)
-
-        content.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -18),
-            statusBox.widthAnchor.constraint(equalToConstant: 380),
-            seg.widthAnchor.constraint(equalToConstant: 380),
-            btnRow.widthAnchor.constraint(equalToConstant: 380),
-            startBtn.heightAnchor.constraint(equalToConstant: 36),
-            stopBtn.heightAnchor.constraint(equalToConstant: 36),
-        ])
-
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 440, height: 420),
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 430),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        win.title = "잠자기 방지  1.0.4"
-        win.contentView = content
-        win.center()
-        win.isReleasedWhenClosed = false
-        win.makeKeyAndOrderFront(nil)
-        window = win
+        window.title = "잠자기 방지"
+        window.isReleasedWhenClosed = true
+        window.center()
+        self.window = window
 
-        NSApp.activate(ignoringOtherApps: true)
+        let content = NSView(frame: window.contentView!.bounds)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView = content
+
+        let title = NSTextField(labelWithString: "잠자기 방지")
+        title.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let closedHint = NSTextField(labelWithString: "뚜껑을 닫았을 때")
+        closedHint.textColor = .secondaryLabelColor
+        closedHint.translatesAutoresizingMaskIntoConstraints = false
+
+        let closedSeg = NSSegmentedControl(labels: closedLabels, trackingMode: .selectOne, target: nil, action: nil)
+        closedSeg.segmentStyle = .rounded
+        closedSeg.selectedSegment = 3
+        closedSeg.translatesAutoresizingMaskIntoConstraints = false
+        self.closedSeg = closedSeg
+
+        let openHint = NSTextField(labelWithString: "뚜껑을 열었을 때")
+        openHint.textColor = .secondaryLabelColor
+        openHint.translatesAutoresizingMaskIntoConstraints = false
+
+        let openSeg = NSSegmentedControl(labels: openLabels, trackingMode: .selectOne, target: nil, action: nil)
+        openSeg.segmentStyle = .rounded
+        openSeg.selectedSegment = 0
+        openSeg.translatesAutoresizingMaskIntoConstraints = false
+        self.openSeg = openSeg
+
+        let start = NSButton(title: "시작", target: self, action: #selector(startPressed))
+        start.bezelStyle = .rounded
+        start.setButtonType(.momentaryPushIn)
+        start.translatesAutoresizingMaskIntoConstraints = false
+        start.keyEquivalent = "\r"
+        startBtn = start
+
+        let stop = NSButton(title: "해제", target: self, action: #selector(stopPressed))
+        stop.bezelStyle = .rounded
+        stop.translatesAutoresizingMaskIntoConstraints = false
+        stopBtn = stop
+
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 10
+        box.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        box.translatesAutoresizingMaskIntoConstraints = false
+        statusBox = box
+
+        phaseBadge.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        phaseBadge.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.systemFont(ofSize: 13)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        countdownLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
+        countdownLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        box.addSubview(phaseBadge)
+        box.addSubview(statusLabel)
+        box.addSubview(countdownLabel)
+
+        let note = NSTextField(labelWithString: "1.2.0  ·  덮개를 열면 닫힘 유지를 바로 풀고, 시간은 워치독이 벽시계로 끝냅니다")
+        note.textColor = .secondaryLabelColor
+        note.font = NSFont.systemFont(ofSize: 11)
+        note.translatesAutoresizingMaskIntoConstraints = false
+
+        content.addSubview(title)
+        content.addSubview(closedHint)
+        content.addSubview(closedSeg)
+        content.addSubview(openHint)
+        content.addSubview(openSeg)
+        content.addSubview(start)
+        content.addSubview(stop)
+        content.addSubview(box)
+        content.addSubview(note)
+
+        NSLayoutConstraint.activate([
+            title.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            title.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+
+            closedHint.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 16),
+            closedHint.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            closedSeg.topAnchor.constraint(equalTo: closedHint.bottomAnchor, constant: 6),
+            closedSeg.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            closedSeg.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+
+            openHint.topAnchor.constraint(equalTo: closedSeg.bottomAnchor, constant: 14),
+            openHint.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            openSeg.topAnchor.constraint(equalTo: openHint.bottomAnchor, constant: 6),
+            openSeg.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            openSeg.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+
+            start.topAnchor.constraint(equalTo: openSeg.bottomAnchor, constant: 16),
+            start.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            start.widthAnchor.constraint(equalToConstant: 96),
+            stop.centerYAnchor.constraint(equalTo: start.centerYAnchor),
+            stop.leadingAnchor.constraint(equalTo: start.trailingAnchor, constant: 10),
+            stop.widthAnchor.constraint(equalToConstant: 96),
+
+            box.topAnchor.constraint(equalTo: start.bottomAnchor, constant: 18),
+            box.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            box.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            box.bottomAnchor.constraint(equalTo: note.topAnchor, constant: -14),
+
+            phaseBadge.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
+            phaseBadge.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
+            statusLabel.topAnchor.constraint(equalTo: phaseBadge.bottomAnchor, constant: 6),
+            statusLabel.leadingAnchor.constraint(equalTo: phaseBadge.leadingAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+            countdownLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
+            countdownLabel.leadingAnchor.constraint(equalTo: phaseBadge.leadingAnchor),
+            countdownLabel.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
+            countdownLabel.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14),
+
+            note.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            note.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            note.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+        ])
+
         updateButtons()
         updateStatusVisuals()
     }
 
-    @objc func modeChanged(_ sender: NSButton) {
-        if sender === radioClosed {
-            radioClosed.state = .on
-            radioOpen.state = .off
-        } else {
-            radioOpen.state = .on
-            radioClosed.state = .off
-        }
-    }
-
-    // MARK: Buttons — 규칙: 세션 켜짐 ⇒ 시작 OFF / 해제 ON
-
-    /// 시작·해제 isEnabled + **시각 구분** 정본.
-    /// 규칙: isSessionActive → 시작은 어둡게 잠금, 해제만 밝게 활성
-    func updateButtons() {
-        if isSessionActive {
-            // 시작: 다시 못 누름 + 확실히 어두움 (isEnabled만으로는 구버전 UI에서 구분이 약함)
-            startBtn.isEnabled = false
-            startBtn.title = "시작됨"
-            startBtn.keyEquivalent = ""
-            startBtn.alphaValue = 0.35
-            startBtn.contentTintColor = .tertiaryLabelColor
-
-            if isStopping {
-                stopBtn.isEnabled = false
-                stopBtn.title = "해제 중…"
-                stopBtn.keyEquivalent = ""
-                stopBtn.alphaValue = 0.55
-                stopBtn.contentTintColor = .secondaryLabelColor
-            } else {
-                stopBtn.isEnabled = true
-                stopBtn.title = "해제"
-                stopBtn.keyEquivalent = "\r"
-                stopBtn.alphaValue = 1.0
-                stopBtn.contentTintColor = .systemRed
-                // 강조: 기본 버튼처럼 보이도록
-                window?.defaultButtonCell = stopBtn.cell as? NSButtonCell
-            }
-
-            radioClosed.isEnabled = false
-            radioOpen.isEnabled = false
-            seg.isEnabled = false
-            radioClosed.alphaValue = 0.45
-            radioOpen.alphaValue = 0.45
-            seg.alphaValue = 0.45
-        } else {
-            let canStart = !isStarting && !isStopping
-            startBtn.isEnabled = canStart
-            startBtn.title = "시작"
-            startBtn.keyEquivalent = canStart ? "\r" : ""
-            startBtn.alphaValue = canStart ? 1.0 : 0.45
-            startBtn.contentTintColor = canStart ? .controlAccentColor : .tertiaryLabelColor
-            window?.defaultButtonCell = canStart ? (startBtn.cell as? NSButtonCell) : nil
-
-            stopBtn.isEnabled = false
-            stopBtn.title = "해제"
-            stopBtn.keyEquivalent = ""
-            stopBtn.alphaValue = 0.35
-            stopBtn.contentTintColor = .tertiaryLabelColor
-
-            radioClosed.isEnabled = canStart
-            radioOpen.isEnabled = canStart
-            seg.isEnabled = canStart
-            radioClosed.alphaValue = 1.0
-            radioOpen.alphaValue = 1.0
-            seg.alphaValue = 1.0
-        }
-
-        startBtn.needsDisplay = true
-        stopBtn.needsDisplay = true
-        window?.viewsNeedDisplay = true
-    }
-
-    func updateStatusVisuals() {
-        if isSessionActive {
-            let closed = sessionClosedMode
-            phaseBadge.stringValue = closed ? "●  작동 중 · 뚜껑 닫아도 OK" : "●  작동 중"
-            phaseBadge.textColor = closed ? .systemOrange : .systemGreen
-            let tint: NSColor = closed ? .systemOrange : .systemGreen
-            statusBox.layer?.backgroundColor = tint.withAlphaComponent(0.12).cgColor
-            statusBox.layer?.borderWidth = 1.5
-            statusBox.layer?.borderColor = tint.withAlphaComponent(0.55).cgColor
-
-            statusLabel.stringValue = closed
-                ? "뚜껑을 닫아도 깨어 있음"
-                : "뚜껑을 열어둘 때만 깨어 있음"
-            statusLabel.textColor = closed ? .systemOrange : .systemGreen
-
-            if sessionUnlimited {
-                countdownLabel.stringValue = "무제한"
-                countdownLabel.textColor = .labelColor
-            } else if let until = localUntilEpoch ?? readUntilEpoch() {
-                let left = until - Int(Date().timeIntervalSince1970)
-                if left > 0 {
-                    countdownLabel.stringValue = fmtDuration(left)
-                    countdownLabel.textColor = .labelColor
-                } else {
-                    countdownLabel.stringValue = "00분 00초"
-                    countdownLabel.textColor = .secondaryLabelColor
-                }
-            } else {
-                countdownLabel.stringValue = "…"
-                countdownLabel.textColor = .secondaryLabelColor
-            }
-        } else {
-            phaseBadge.stringValue = "○  작동 준비"
-            phaseBadge.textColor = .secondaryLabelColor
-            statusBox.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-            statusBox.layer?.borderWidth = 1
-            statusBox.layer?.borderColor = NSColor.separatorColor.cgColor
-
-            statusLabel.stringValue = "평소처럼 잠자기 · 시작을 누르면 잠자기 방지"
-            statusLabel.textColor = .secondaryLabelColor
-            countdownLabel.stringValue = "—"
-            countdownLabel.textColor = .tertiaryLabelColor
-        }
+    func restoreIfNeeded() {
+        guard sleepDisabled() || caffeinateAlive() || watchdogAlive() else { return }
+        isSessionActive = true
+        needsAdmin = sleepDisabled()
+        beginActivity()
+        updateButtons()
+        updateStatusVisuals()
     }
 
     func tick() {
-        // 파일 기준 until 동기화
-        if isSessionActive, !sessionUnlimited, localUntilEpoch == nil {
-            localUntilEpoch = readUntilEpoch()
+        if isSessionActive, !watchdogAlive(), !sleepDisabled(), !caffeinateAlive() {
+            isSessionActive = false
+            closedUntil = nil
+            openUntil = nil
+            openUnlimited = false
+            needsAdmin = false
+            endActivity()
         }
-
-        if isSessionActive, !sessionUnlimited, let until = localUntilEpoch {
-            let left = until - Int(Date().timeIntervalSince1970)
-            if left <= 0 {
-                // 타이머 만료 → 세션 종료 (버튼도 시작만 활성)
-                isSessionActive = false
-                isStarting = false
-                isStopping = false
-                sessionClosedMode = false
-                localUntilEpoch = nil
-                deadTicks = 0
-                updateButtons()
-            }
-        }
-
-        // 시스템이 죽었고 무제한/잔여 없으면 종료 (오탐 방지: 연속 4틱)
-        if isSessionActive, !isStarting, !isStopping {
-            let systemActive = sleepDisabled() || caffeinateAlive()
-            let remLeft: Int = {
-                if sessionUnlimited { return 1 }
-                if let until = localUntilEpoch {
-                    return until - Int(Date().timeIntervalSince1970)
-                }
-                return 0
-            }()
-            if !systemActive && remLeft <= 0 {
-                deadTicks += 1
-                if deadTicks >= 4 {
-                    isSessionActive = false
-                    sessionClosedMode = false
-                    localUntilEpoch = nil
-                    sessionUnlimited = false
-                    deadTicks = 0
-                    updateButtons()
-                }
-            } else {
-                deadTicks = 0
-            }
-        }
-
         updateStatusVisuals()
-        // 버튼 상태는 세션 플래그만 따르므로 매 틱 재적용 (외부 간섭 방지)
         updateButtons()
     }
 
-    func bumpGeneration() -> Int {
-        let (_, out) = shell(
-            #"G=$(( $(cat /tmp/lidguard_gen 2>/dev/null || echo 0) + 1 )); echo $G > /tmp/lidguard_gen; echo $G"#
-        )
-        return Int(out) ?? 1
+    func updateButtons() {
+        let busy = isStarting || isStopping
+        startBtn?.isEnabled = !isSessionActive && !busy
+        stopBtn?.isEnabled = (isSessionActive || sleepDisabled() || caffeinateAlive()) && !busy
+        closedSeg?.isEnabled = !isSessionActive && !busy
+        openSeg?.isEnabled = !isSessionActive && !busy
     }
 
-    // MARK: Actions
+    func remainingText() -> String {
+        var parts: [String] = []
+        if let until = closedUntil, until > 0 {
+            parts.append("닫힘  " + fmtDuration(until - nowEpoch()))
+        } else {
+            parts.append("닫힘  끔")
+        }
+        if openUnlimited {
+            parts.append("열림  무한")
+        } else if let until = openUntil, until > 0 {
+            parts.append("열림  " + fmtDuration(until - nowEpoch()))
+        } else {
+            parts.append("열림  끔")
+        }
+        return parts.joined(separator: "   ·   ")
+    }
+
+    func updateStatusVisuals() {
+        if isStarting {
+            phaseBadge.stringValue = "●  켜는 중"
+            statusLabel.stringValue = "권한 확인 또는 워치독 시작…"
+            return
+        }
+        if isStopping {
+            phaseBadge.stringValue = "●  해제 중"
+            statusLabel.stringValue = "잠자기 설정을 되돌리는 중"
+            return
+        }
+        if isSessionActive || sleepDisabled() || caffeinateAlive() {
+            phaseBadge.stringValue = "●  작동 중"
+            statusLabel.stringValue = "덮개를 열면 닫힘 유지를 즉시 해제합니다"
+            countdownLabel.stringValue = remainingText()
+            statusBox?.layer?.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.18).cgColor
+        } else {
+            phaseBadge.stringValue = "○  작동 준비"
+            statusLabel.stringValue = "평소처럼 잠자기 · 시작을 누르면 잠자기 방지"
+            countdownLabel.stringValue = "닫힘 · 열림 시간을 각각 고르세요"
+            statusBox?.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        }
+    }
 
     @objc func startPressed() {
-        guard !isSessionActive else { return }
-        guard !isStarting, !isStopping else { return }
-
-        let idx = max(0, min(seg.selectedSegment, durations.count - 1))
-        let seconds = durations[idx]
-        let closedMode = (radioClosed.state == .on)
-
-        // ★ 클릭 즉시: 시작 OFF / 해제 ON (시스템·암호 기다리지 않음)
-        isSessionActive = true
-        isStarting = true
-        isStopping = false
-        sessionClosedMode = closedMode
-        sessionUnlimited = (seconds == 0)
-        if seconds > 0 {
-            localUntilEpoch = Int(Date().timeIntervalSince1970) + seconds
-        } else {
-            localUntilEpoch = nil
+        guard !isStarting, !isSessionActive else { return }
+        let closedIdx = max(0, closedSeg?.selectedSegment ?? 3)
+        let openIdx = max(0, openSeg?.selectedSegment ?? 0)
+        let closedSeconds = closedDurations[min(closedIdx, closedDurations.count - 1)]
+        let openSeconds = openDurations[min(openIdx, openDurations.count - 1)]
+        if closedSeconds == 0, openSeconds == 0 {
+            statusLabel.stringValue = "닫힘·열림이 모두 끔입니다 · 하나를 고르세요"
+            return
         }
-        deadTicks = 0
-        updateButtons() // start=OFF, stop=ON
+        isStarting = true
+        updateButtons()
         updateStatusVisuals()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            _ = shell(
-                "test -f /tmp/lidguard_caffeinate.pid && kill $(cat /tmp/lidguard_caffeinate.pid) 2>/dev/null; rm -f /tmp/lidguard_caffeinate.pid /tmp/lidguard_until /tmp/lidguard_revert.sh"
-            )
-
-            var ok = true
-            if closedMode {
-                let gen = self.bumpGeneration()
-                if seconds > 0 {
-                    let full =
-                        "/usr/bin/pmset -a disablesleep 1; " +
-                        "echo $(( $(date +%s) + \(seconds) )) > /tmp/lidguard_until; " +
-                        "( sleep \(seconds); " +
-                        "[ \"$(cat /tmp/lidguard_gen 2>/dev/null)\" = \"\(gen)\" ] && " +
-                        "{ /usr/bin/pmset -a disablesleep 0; rm -f /tmp/lidguard_until; }; " +
-                        ") >/dev/null 2>&1 &"
-                    ok = adminShell(full)
-                } else {
-                    ok = adminShell("/usr/bin/pmset -a disablesleep 1; rm -f /tmp/lidguard_until")
-                }
-            } else {
-                if seconds > 0 {
-                    let (code, _) = shell(
-                        "nohup /usr/bin/caffeinate -i -t \(seconds) >/dev/null 2>&1 & echo $! > /tmp/lidguard_caffeinate.pid; echo $(( $(date +%s) + \(seconds) )) > /tmp/lidguard_until"
-                    )
-                    ok = (code == 0)
-                } else {
-                    let (code, _) = shell(
-                        "nohup /usr/bin/caffeinate -i >/dev/null 2>&1 & echo $! > /tmp/lidguard_caffeinate.pid; rm -f /tmp/lidguard_until"
-                    )
-                    ok = (code == 0)
-                }
-            }
-
+            let ok = self?.startSession(closedSeconds: closedSeconds, openSeconds: openSeconds) ?? false
             DispatchQueue.main.async {
+                guard let self else { return }
                 self.isStarting = false
                 if ok {
                     self.isSessionActive = true
-                    if let fileUntil = readUntilEpoch() {
-                        self.localUntilEpoch = fileUntil
+                    self.needsAdmin = closedSeconds > 0
+                    let now = nowEpoch()
+                    self.closedUntil = closedSeconds > 0 ? now + closedSeconds : nil
+                    if openSeconds < 0 {
+                        self.openUnlimited = true
+                        self.openUntil = nil
+                    } else if openSeconds > 0 {
+                        self.openUnlimited = false
+                        self.openUntil = now + openSeconds
+                    } else {
+                        self.openUnlimited = false
+                        self.openUntil = nil
                     }
+                    self.beginActivity()
                 } else {
-                    self.isSessionActive = false
-                    self.sessionClosedMode = false
-                    self.localUntilEpoch = nil
-                    self.sessionUnlimited = false
-                    _ = shell("rm -f /tmp/lidguard_until /tmp/lidguard_caffeinate.pid")
+                    self.statusLabel.stringValue = "시작 실패 · 암호 취소 또는 워치독 오류"
                 }
                 self.updateButtons()
                 self.updateStatusVisuals()
@@ -552,56 +411,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func stopPressed() {
-        guard isSessionActive else { return }
         guard !isStopping else { return }
-
         isStopping = true
-        isStarting = false
-        updateButtons() // 해제 중… 잠금
-
+        updateButtons()
+        updateStatusVisuals()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            _ = self.bumpGeneration()
-            _ = shell(
-                "test -f /tmp/lidguard_caffeinate.pid && kill $(cat /tmp/lidguard_caffeinate.pid) 2>/dev/null; rm -f /tmp/lidguard_caffeinate.pid /tmp/lidguard_until /tmp/lidguard_revert.sh"
-            )
-            if sleepDisabled() || self.sessionClosedMode {
-                _ = adminShell("/usr/bin/pmset -a disablesleep 0; rm -f /tmp/lidguard_until; exit 0")
-            } else {
-                _ = shell("rm -f /tmp/lidguard_until")
-            }
+            self?.stopSession()
             DispatchQueue.main.async {
+                guard let self else { return }
                 self.isStopping = false
-                self.isStarting = false
                 self.isSessionActive = false
-                self.sessionClosedMode = false
-                self.localUntilEpoch = nil
-                self.sessionUnlimited = false
-                self.deadTicks = 0
+                self.closedUntil = nil
+                self.openUntil = nil
+                self.openUnlimited = false
+                self.needsAdmin = false
+                self.endActivity()
                 self.updateButtons()
                 self.updateStatusVisuals()
             }
         }
     }
+
+    private func startSession(closedSeconds: Int, openSeconds: Int) -> Bool {
+        try? FileManager.default.removeItem(atPath: stopPath)
+        installHelpers()
+        let gen = bumpGeneration()
+        let now = nowEpoch()
+        let closedUntilEpoch = closedSeconds > 0 ? now + closedSeconds : 0
+        let openUntilEpoch = openSeconds > 0 ? now + openSeconds : 0
+        if closedUntilEpoch > 0 {
+            writeFile(untilPath, "\(closedUntilEpoch)\n")
+        } else {
+            try? FileManager.default.removeItem(atPath: untilPath)
+        }
+
+        var args = "--gen \(gen) --closed-until \(closedUntilEpoch) --open-until \(openUntilEpoch)"
+        if openSeconds < 0 {
+            args += " --open-unlimited"
+        }
+        if closedSeconds > 0 {
+            args += " --sleepnow-if-closed"
+        }
+
+        let launch = "/usr/bin/python3 \(daemonizeCopyPath) \(watchdogPidPath) /bin/bash \(watchdogCopyPath) \(args) >>\(watchdogLogPath) 2>&1"
+        if closedSeconds > 0 {
+            let script = """
+            #!/bin/bash
+            \(launch)
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              if [ -f \(watchdogPidPath) ] && kill -0 "$(cat \(watchdogPidPath))" 2>/dev/null; then
+                exit 0
+              fi
+              sleep 0.1
+            done
+            exit 1
+            """
+            writeFile(startScriptPath, script)
+            _ = shell("chmod 755 \(startScriptPath)")
+            return adminShell("/bin/bash \(startScriptPath)")
+        }
+
+        _ = shell(launch)
+        for _ in 0..<15 {
+            if watchdogAlive() { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return watchdogAlive()
+    }
+
+    private func stopSession() {
+        writeFile(stopPath, "1\n")
+        killCaffeinate()
+        for _ in 0..<20 {
+            if !sleepDisabled(), !watchdogAlive() { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if sleepDisabled() {
+            _ = adminShell("/usr/bin/pmset -a disablesleep 0; exit 0")
+        }
+        _ = bumpGeneration()
+        try? FileManager.default.removeItem(atPath: untilPath)
+        try? FileManager.default.removeItem(atPath: stopPath)
+        try? FileManager.default.removeItem(atPath: watchdogPidPath)
+    }
+
+    private func beginActivity() {
+        guard activity == nil else { return }
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .suddenTerminationDisabled],
+            reason: "lidguard session"
+        )
+    }
+
+    private func endActivity() {
+        if let activity {
+            ProcessInfo.processInfo.endActivity(activity)
+            self.activity = nil
+        }
+    }
 }
 
-// MARK: - Entry
+@main
+enum LidguardApp {
+    static let delegate = AppDelegate()
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-
-let mainMenu = NSMenu()
-let appMenuItem = NSMenuItem()
-mainMenu.addItem(appMenuItem)
-let appMenu = NSMenu()
-appMenu.addItem(
-    withTitle: "잠자기 방지 종료",
-    action: #selector(NSApplication.terminate(_:)),
-    keyEquivalent: "q"
-)
-appMenuItem.submenu = appMenu
-app.mainMenu = mainMenu
-
-app.setActivationPolicy(.regular)
-app.run()
+    static func main() {
+        let app = NSApplication.shared
+        app.delegate = delegate
+        let menu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        menu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "잠자기 방지 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        app.mainMenu = menu
+        app.setActivationPolicy(.regular)
+        app.run()
+    }
+}

@@ -1,59 +1,31 @@
-#!/usr/bin/env bash
-# Build 잠자기방지.app (lidguard) for macOS Apple Silicon / Intel.
+#!/bin/bash
 set -euo pipefail
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="$ROOT/Sources/lidguard/main.swift"
-OUT_DIR="${1:-$ROOT/dist}"
-APP="$OUT_DIR/잠자기방지.app"
-BIN_NAME="lidguard"
-MIN_OS="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+APP_NAME="잠자기방지.app"
+DIST="$ROOT/dist/$APP_NAME"
+MACOS="$DIST/Contents/MacOS"
+RES="$DIST/Contents/Resources"
+SDK="$(xcrun --show-sdk-path)"
 
-mkdir -p "$OUT_DIR"
-rm -rf "$APP"
+rm -rf "$DIST"
+mkdir -p "$MACOS" "$RES" "$DIST/Contents"
 
-echo "==> Compiling $BIN_NAME (macOS $MIN_OS+)"
-TMPBIN="$(mktemp -t lidguard)"
-swiftc \
-  -O \
-  -target "arm64-apple-macosx${MIN_OS}" \
-  -sdk "$(xcrun --show-sdk-path)" \
-  -framework AppKit \
-  -framework Foundation \
-  -o "$TMPBIN" \
-  "$SRC"
+swiftc -O -parse-as-library \
+  -sdk "$SDK" \
+  -target arm64-apple-macos12 \
+  -framework AppKit -framework Foundation \
+  "$ROOT/Sources/lidguard/main.swift" \
+  -o "$MACOS/lidguard"
 
-# Optional universal binary if Intel slice requested
-if [[ "${UNIVERSAL:-0}" == "1" ]]; then
-  TMPX86="$(mktemp -t lidguard-x86)"
-  swiftc \
-    -O \
-    -target "x86_64-apple-macosx${MIN_OS}" \
-    -sdk "$(xcrun --show-sdk-path)" \
-    -framework AppKit \
-    -framework Foundation \
-    -o "$TMPX86" \
-    "$SRC"
-  lipo -create -output "${TMPBIN}.uni" "$TMPBIN" "$TMPX86"
-  mv "${TMPBIN}.uni" "$TMPBIN"
-  rm -f "$TMPX86"
+cp "$ROOT/Info.plist" "$DIST/Contents/Info.plist"
+cp "$ROOT/scripts/watchdog.sh" "$RES/watchdog.sh"
+cp "$ROOT/scripts/daemonize.py" "$RES/daemonize.py"
+chmod 755 "$RES/watchdog.sh" "$RES/daemonize.py"
+
+ICON_SRC="/Users/kwangsunglee/Desktop/_바탕_정리_2026-08-11/04_도구앱/잠자기방지.app/Contents/Resources/AppIcon.icns"
+if [ -f "$ICON_SRC" ]; then
+  cp "$ICON_SRC" "$RES/AppIcon.icns"
 fi
 
-echo "==> Assembling $APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$TMPBIN" "$APP/Contents/MacOS/$BIN_NAME"
-chmod +x "$APP/Contents/MacOS/$BIN_NAME"
-rm -f "$TMPBIN"
-
-cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
-if [[ -f "$ROOT/assets/AppIcon.icns" ]]; then
-  cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-fi
-
-# Ad-hoc sign so Gatekeeper is happier on local builds
-if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP" 2>/dev/null || true
-fi
-
-echo "==> Done: $APP"
-echo "    Open with: open \"$APP\""
+codesign --force --sign - --timestamp=none "$DIST" >/dev/null
+echo "built $DIST"
