@@ -44,7 +44,7 @@ run_wd() {
   LIDGUARD_STATE_DIR="$TMP" \
   LIDGUARD_POLL_SECONDS="${POLL:-1}" \
   LIDGUARD_PMSET="$fake_pmset" \
-  LIDGUARD_IOREG="$fake_ioreg" \
+  LIDGUARD_IOREG="${IOREG_OVERRIDE:-$fake_ioreg}" \
   LIDGUARD_PKILL="/usr/bin/true" \
   LIDGUARD_PGREP="$fake_pgrep" \
   LIDGUARD_CAFFEINATE="$fake_caffeinate" \
@@ -117,19 +117,44 @@ grep -q "disablesleep 0" "$TMP/pmset.log"
 rm -f "$TMP/lidguard_stop"
 echo "ok stop-file"
 
-# 7) closed-mode with lid OPEN must clear disablesleep and must not sleepnow
+# 7) closed-mode with lid OPEN must set disablesleep 1 immediately, then
+#    clear it on deadline, and must not sleepnow
 : >"$TMP/pmset.log"
 : >"$log"
 echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 30 ))
-# one poll then we need it to stay... until 30s would hang. Use until +1 with lid open:
 until=$(( $(date +%s) + 1 ))
 FAKE_CLAMSHELL=No POLL=1 run_wd --until "$until" --gen 1 --mode closed --sleepnow-if-closed
 if grep -q "sleepnow" "$TMP/pmset.log"; then
   echo "fail: sleepnow while lid open" >&2
   exit 1
 fi
+grep -q "disablesleep 1" "$TMP/pmset.log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
-echo "ok lid-open does not keep disablesleep"
+grep -q "phase=lid-open-closed-armed" "$log"
+echo "ok lid-open preemptive disablesleep"
+
+# 8) closed-mode with lid closed also sets disablesleep 1
+: >"$TMP/pmset.log"
+: >"$log"
+echo 1 >"$TMP/lidguard_gen"
+until=$(( $(date +%s) + 1 ))
+FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed
+grep -q "disablesleep 1" "$TMP/pmset.log"
+grep -q "disablesleep 0" "$TMP/pmset.log"
+echo "ok lid-closed sets disablesleep"
+
+# 9) a missing ioreg executable must remain unknown and must never cause a
+#    false sleepnow request.
+: >"$TMP/pmset.log"
+: >"$log"
+echo 1 >"$TMP/lidguard_gen"
+until=$(( $(date +%s) + 1 ))
+IOREG_OVERRIDE="$TMP/does-not-exist" POLL=1 run_wd --until "$until" --gen 1 --mode closed --sleepnow-if-closed
+if grep -q "sleepnow" "$TMP/pmset.log"; then
+  echo "fail: sleepnow with unavailable lid sensor" >&2
+  exit 1
+fi
+grep -q "state unavailable" "$log"
+echo "ok missing ioreg is fail-safe"
 
 echo "ALL PASS"
