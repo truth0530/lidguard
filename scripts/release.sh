@@ -16,8 +16,9 @@ if gh release view "$TAG" >/dev/null 2>&1; then
   echo "$TAG 릴리스가 이미 있습니다" >&2; exit 1
 fi
 
-bash tests/test_watchdog.sh
 bash scripts/build.sh
+LIDGUARD_BIN="$ROOT/dist/잠자기방지.app/Contents/MacOS/lidguard" bash tests/test_watchdog.sh
+bash tests/test_native.sh
 
 OUT="$ROOT/dist/release"
 rm -rf "$OUT"; mkdir -p "$OUT"

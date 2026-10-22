@@ -1,193 +1,168 @@
 #!/bin/bash
+# Exercises `lidguard --watchdog` with a fake pmset and env-faked lid/thermal
+# state. Fakes are honoured only for non-root processes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WATCHDOG="$ROOT/scripts/watchdog.sh"
 TMP="$(mktemp -d /tmp/lidguard-test.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
-fake_pmset="$TMP/pmset"
-fake_ioreg="$TMP/ioreg"
-fake_pgrep="$TMP/pgrep"
-fake_caffeinate="$TMP/caffeinate"
-log="$TMP/lidguard_watchdog.log"
+if [ -z "${LIDGUARD_BIN:-}" ]; then
+  bash "$ROOT/scripts/build.sh" >/dev/null 2>&1
+  LIDGUARD_BIN="$ROOT/dist/잠자기방지.app/Contents/MacOS/lidguard"
+fi
+BIN="$LIDGUARD_BIN"
 
+fake_pmset="$TMP/pmset"
+log="$TMP/lidguard_watchdog.log"
 cat >"$fake_pmset" <<'EOF'
 #!/bin/bash
 echo "pmset $*" >>"${LIDGUARD_STATE_DIR}/pmset.log"
-if [ "${1:-}" = "-g" ] && [ "${2:-}" = "therm" ]; then
-  if [ -n "${FAKE_THERM:-}" ]; then
-    echo "CPU_Speed_Limit = ${FAKE_THERM}"
-  fi
-fi
 EOF
-cat >"$fake_ioreg" <<'EOF'
-#!/bin/bash
-if [ "${FAKE_CLAMSHELL:-}" = "Yes" ]; then
-  echo '"AppleClamshellState" = Yes'
-else
-  echo '"AppleClamshellState" = No'
-fi
-EOF
-cat >"$fake_pgrep" <<'EOF'
-#!/bin/bash
-exit ${FAKE_PGREP_EXIT:-0}
-EOF
-cat >"$fake_caffeinate" <<'EOF'
-#!/bin/bash
-echo "caffeinate $*" >>"${LIDGUARD_STATE_DIR}/caffeinate.log"
-exec /bin/sleep 60
-EOF
-chmod +x "$fake_pmset" "$fake_ioreg" "$fake_pgrep" "$fake_caffeinate"
+chmod +x "$fake_pmset"
 
 run_wd() {
   LIDGUARD_STATE_DIR="$TMP" \
   LIDGUARD_POLL_SECONDS="${POLL:-1}" \
   LIDGUARD_PMSET="$fake_pmset" \
-  LIDGUARD_IOREG="${IOREG_OVERRIDE:-$fake_ioreg}" \
-  LIDGUARD_PKILL="/usr/bin/true" \
-  LIDGUARD_PGREP="$fake_pgrep" \
-  LIDGUARD_CAFFEINATE="$fake_caffeinate" \
   LIDGUARD_LOG="$log" \
-  FAKE_THERM="${FAKE_THERM:-}" \
-  FAKE_CLAMSHELL="${FAKE_CLAMSHELL:-No}" \
-  FAKE_PGREP_EXIT="${FAKE_PGREP_EXIT:-0}" \
-  "$WATCHDOG" "$@"
+  LIDGUARD_GUI_GRACE="${GRACE:-60}" \
+  LIDGUARD_FAKE_THERMAL="${FAKE_THERM:-nominal}" \
+  LIDGUARD_FAKE_CLAMSHELL="${FAKE_CLAMSHELL:-No}" \
+  "$BIN" --watchdog "$@"
 }
 
-echo 1 >"$TMP/lidguard_gen"
+reset() {
+  : >"$TMP/pmset.log"
+  : >"$log"
+  rm -f "$TMP/lidguard_last_revert" "$TMP/lidguard_stop"
+  echo 1 >"$TMP/lidguard_gen"
+}
+
+fail() { echo "fail: $*" >&2; exit 1; }
+soon() { echo $(( $(date +%s) + $1 )); }
 
 # 1) closed + lid closed: deadline reverts disablesleep
-POLL=1
-until=$(( $(date +%s) + 1 ))
-FAKE_CLAMSHELL=Yes run_wd --until "$until" --gen 1 --mode closed
+reset
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 1)"
 grep -q "pmset -a disablesleep 0" "$TMP/pmset.log"
 grep -q "revert: closed-idle" "$log"
 echo "ok closed deadline"
 
 # 2) gen mismatch does not revert
-: >"$TMP/pmset.log"
+reset
 echo 2 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 1 ))
-FAKE_CLAMSHELL=Yes run_wd --until "$until" --gen 1 --mode closed
-if grep -q "disablesleep 0" "$TMP/pmset.log"; then
-  echo "fail: reverted after gen change" >&2
-  exit 1
-fi
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 1)"
+grep -q "disablesleep 0" "$TMP/pmset.log" && fail "reverted after gen change"
 grep -q "gen changed, exit without revert" "$log"
 echo "ok gen mismatch"
 
-# 3) thermal abort
-: >"$TMP/pmset.log"
-echo 1 >"$TMP/lidguard_gen"
-: >"$log"
-until=$(( $(date +%s) + 30 ))
-FAKE_THERM=50 FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed
-grep -q "thermal" "$log"
+# 3) thermal abort (ProcessInfo.thermalState serious)
+reset
+FAKE_THERM=serious FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 30)"
+grep -q "revert: thermal serious" "$log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
-echo "ok thermal"
+grep -q " thermal serious$" "$TMP/lidguard_last_revert"
+echo "ok thermal (reason recorded)"
 
 # 4) clamshell sleepnow after closed deadline
-: >"$TMP/pmset.log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 1 ))
-FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed --sleepnow-if-closed
-grep -q "sleepnow" "$TMP/pmset.log"
+reset
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 1)" --sleepnow-if-closed
+grep -q "pmset sleepnow" "$TMP/pmset.log"
 echo "ok sleepnow-if-closed"
 
-# 5) open mode never sets disablesleep 1
-: >"$TMP/pmset.log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 1 ))
-POLL=1 run_wd --until "$until" --gen 1 --mode open
-if grep -q "disablesleep 1" "$TMP/pmset.log"; then
-  echo "fail: open mode set disablesleep 1" >&2
-  exit 1
-fi
-echo "ok open mode no disablesleep 1"
+# 5) no closed timer: exits at once and never sets disablesleep 1
+reset
+run_wd --gen 1 --closed-until 0
+grep -q "disablesleep 1" "$TMP/pmset.log" && fail "set disablesleep with no closed timer"
+echo "ok no closed timer"
 
 # 6) stop file reverts before deadline
-: >"$TMP/pmset.log"
-echo 1 >"$TMP/lidguard_gen"
+reset
 touch "$TMP/lidguard_stop"
-until=$(( $(date +%s) + 30 ))
-FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed
-grep -q "stop-file" "$log"
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 30)"
+grep -q "revert: stop-file" "$log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
-rm -f "$TMP/lidguard_stop"
 echo "ok stop-file"
 
-# 7) closed-mode with lid OPEN must set disablesleep 1 immediately, then
-#    clear it on deadline, and must not sleepnow
-: >"$TMP/pmset.log"
-: >"$log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 1 ))
-FAKE_CLAMSHELL=No POLL=1 run_wd --until "$until" --gen 1 --mode closed --sleepnow-if-closed
-if grep -q "sleepnow" "$TMP/pmset.log"; then
-  echo "fail: sleepnow while lid open" >&2
-  exit 1
-fi
+# 7) lid OPEN: set disablesleep 1 at once, clear on deadline, never sleepnow
+reset
+FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 1)" --sleepnow-if-closed
+grep -q "sleepnow" "$TMP/pmset.log" && fail "sleepnow while lid open"
 grep -q "disablesleep 1" "$TMP/pmset.log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
 grep -q "phase=lid-open-closed-armed" "$log"
 echo "ok lid-open preemptive disablesleep"
 
-# 8) closed-mode with lid closed also sets disablesleep 1
-: >"$TMP/pmset.log"
-: >"$log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 1 ))
-FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed
+# 8) lid closed also sets disablesleep 1
+reset
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 1)"
 grep -q "disablesleep 1" "$TMP/pmset.log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
 echo "ok lid-closed sets disablesleep"
 
-# 9) a missing ioreg executable must remain unknown and must never cause a
-#    false sleepnow request.
-: >"$TMP/pmset.log"
-: >"$log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 1 ))
-IOREG_OVERRIDE="$TMP/does-not-exist" POLL=1 run_wd --until "$until" --gen 1 --mode closed --sleepnow-if-closed
-if grep -q "sleepnow" "$TMP/pmset.log"; then
-  echo "fail: sleepnow with unavailable lid sensor" >&2
-  exit 1
-fi
+# 9) unreadable lid sensor stays unknown and never causes sleepnow
+reset
+FAKE_CLAMSHELL=unknown run_wd --gen 1 --closed-until "$(soon 1)" --sleepnow-if-closed
+grep -q "sleepnow" "$TMP/pmset.log" && fail "sleepnow with unavailable lid sensor"
 grep -q "state unavailable" "$log"
-echo "ok missing ioreg is fail-safe"
+echo "ok unknown lid is fail-safe"
 
-# 10) --require-gui: app force-quit (no lidguard process) reverts before deadline
-: >"$TMP/pmset.log"
-: >"$log"
-rm -f "$TMP/lidguard_last_revert"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 120 ))
-FAKE_PGREP_EXIT=1 FAKE_CLAMSHELL=Yes POLL=0 run_wd --until "$until" --gen 1 --mode closed --require-gui
+# 10) app force-quit (gui pid gone) reverts after the grace period
+reset
+GUI=99990; while kill -0 "$GUI" 2>/dev/null; do GUI=$((GUI - 1)); done
+GRACE=1 FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 120)" --gui-pid "$GUI"
 grep -q "revert: gui-exited" "$log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
 grep -q " gui-exited$" "$TMP/lidguard_last_revert"
-echo "ok require-gui reverts after force-quit"
+echo "ok gui-exited after force-quit"
 
-# 11) --require-gui with the app alive keeps going until the deadline
-: >"$log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 2 ))
-FAKE_PGREP_EXIT=0 FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed --require-gui
-if grep -q "gui-exited" "$log"; then
-  echo "fail: reverted while app alive" >&2
-  exit 1
-fi
+# 11) live gui pid keeps running until the deadline
+reset
+sleep 30 & GUI=$!
+GRACE=1 FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 3)" --gui-pid "$GUI"
+kill $GUI 2>/dev/null || true
+grep -q "gui-exited" "$log" && fail "reverted while app alive"
 grep -q "revert: closed-idle" "$log"
-grep -q " closed-idle$" "$TMP/lidguard_last_revert"
-echo "ok require-gui keeps running while app alive"
+echo "ok live gui keeps running"
 
-# 12) thermal revert is recorded for the GUI
-: >"$log"
-echo 1 >"$TMP/lidguard_gen"
-until=$(( $(date +%s) + 30 ))
-FAKE_THERM=50 FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed
-grep -q " thermal CPU_Speed_Limit=50$" "$TMP/lidguard_last_revert"
-echo "ok thermal reason recorded"
+# 12) pmset runs only on transitions: one set, one clear over several polls
+reset
+FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 4)"
+sets=$(grep -c "disablesleep 1" "$TMP/pmset.log")
+clears=$(grep -c "disablesleep 0" "$TMP/pmset.log")
+[ "$sets" -eq 1 ] || fail "disablesleep 1 called $sets times"
+[ "$clears" -eq 1 ] || fail "disablesleep 0 called $clears times"
+echo "ok pmset only on transitions (set=$sets clear=$clears)"
+
+# 13) SIGTERM reverts
+reset
+# Background the binary itself (not a bash function) so $! is the watchdog pid.
+LIDGUARD_STATE_DIR="$TMP" LIDGUARD_POLL_SECONDS=1 LIDGUARD_PMSET="$fake_pmset" LIDGUARD_LOG="$log" \
+  LIDGUARD_FAKE_THERMAL=nominal LIDGUARD_FAKE_CLAMSHELL=Yes \
+  "$BIN" --watchdog --gen 1 --closed-until "$(soon 60)" &
+WD=$!
+sleep 1.5
+kill -TERM $WD
+wait $WD || true
+grep -q "revert: signal" "$log"
+grep -q "disablesleep 0" "$TMP/pmset.log"
+echo "ok SIGTERM reverts"
+
+# 14) --daemonize detaches into its own session and writes the pidfile
+reset
+pidfile="$TMP/wd.pid"
+start=$(date +%s)
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 60)" --pidfile "$pidfile" --daemonize
+[ $(( $(date +%s) - start )) -le 2 ] || fail "--daemonize did not return quickly"
+for _ in $(seq 1 30); do [ -s "$pidfile" ] && break; sleep 0.1; done
+WD=$(tr -d '[:space:]' <"$pidfile")
+kill -0 "$WD" || fail "daemon not running"
+touch "$TMP/lidguard_stop"
+for _ in $(seq 1 40); do kill -0 "$WD" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$WD" 2>/dev/null && fail "daemon ignored stop file"
+grep -q "revert: stop-file" "$log"
+[ -e "$pidfile" ] && fail "pidfile not removed"
+echo "ok daemonize + stop within poll"
 
 echo "ALL PASS"

@@ -5,12 +5,9 @@ private let stateDir = "/tmp"
 private let genPath = "\(stateDir)/lidguard_gen"
 private let untilPath = "\(stateDir)/lidguard_until"
 private let stopPath = "\(stateDir)/lidguard_stop"
-private let caffeinatePidPath = "\(stateDir)/lidguard_caffeinate.pid"
 private let watchdogPidPath = "\(stateDir)/lidguard_watchdog.pid"
 private let watchdogLogPath = "\(stateDir)/lidguard_watchdog.log"
 private let startScriptPath = "\(stateDir)/lidguard_start.sh"
-private let watchdogCopyPath = "\(stateDir)/lidguard_watchdog.sh"
-private let daemonizeCopyPath = "\(stateDir)/lidguard_daemonize.py"
 private let heartbeatPath = "\(stateDir)/lidguard_heartbeat"
 private let uiStatePath = "\(stateDir)/lidguard_ui"
 private let lastRevertPath = "\(stateDir)/lidguard_last_revert"
@@ -22,21 +19,8 @@ private let closedLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시
 private let openDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, -1]
 private let openLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간", "무한"]
 
-private func shell(_ command: String) -> (Int32, String) {
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-    proc.arguments = ["-lc", command]
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = pipe
-    do {
-        try proc.run()
-        proc.waitUntilExit()
-    } catch {
-        return (1, error.localizedDescription)
-    }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+private func shellQuote(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
 private func appleQuote(_ value: String) -> String {
@@ -46,56 +30,26 @@ private func appleQuote(_ value: String) -> String {
 
 @discardableResult
 private func adminShell(_ command: String) -> (Bool, String) {
-    let script = "do shell script \(appleQuote(command)) with administrator privileges"
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    proc.arguments = ["-e", script]
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = pipe
-    do {
-        try proc.run()
-        proc.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: data, encoding: .utf8) ?? ""
-        return (proc.terminationStatus == 0, out)
-    } catch {
-        return (false, error.localizedDescription)
-    }
+    let result = runTool("/usr/bin/osascript", ["-e", "do shell script \(appleQuote(command)) with administrator privileges"])
+    return (result.status == 0, result.output)
 }
 
-private func sleepDisabled() -> Bool {
-    let (_, out) = shell("pmset -g | awk '/SleepDisabled/{print $2}'")
-    return out.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
-}
-
-/// `kill -0` on a root watchdog returns EPERM and looks "dead" to the GUI.
-private func pidFileAlive(_ path: String) -> Bool {
-    let (status, _) = shell(
-        "PID=$(cat \(path) 2>/dev/null | tr -d '[:space:]'); [ -n \"$PID\" ] && /bin/ps -p \"$PID\" -o pid= >/dev/null"
-    )
-    return status == 0
-}
-
-private func caffeinateAlive() -> Bool {
-    pidFileAlive(caffeinatePidPath)
-}
-
+/// Closed-lid watchdog liveness: pid check (EPERM = alive root process) or a fresh heartbeat.
 private func watchdogAlive() -> Bool {
-    if pidFileAlive(watchdogPidPath) { return true }
+    if let pid = readPidFile(watchdogPidPath), pidAlive(pid) { return true }
     guard let raw = try? String(contentsOfFile: heartbeatPath, encoding: .utf8),
           let ts = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
         return false
     }
-    return nowEpoch() - ts < 25
+    return nowEpoch() - ts < 8
 }
 
-private func lidClosed() -> Bool {
-    let (_, out) = shell(
-        "/usr/sbin/ioreg -r -k AppleClamshellState -d 4 2>/dev/null | awk -F'= ' '/AppleClamshellState/ { gsub(/[ ;]/, \"\", $2); print $2; exit }'"
-    )
-    return out.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "yes"
+private func watchdogPidAlive() -> Bool {
+    guard let pid = readPidFile(watchdogPidPath) else { return false }
+    return pidAlive(pid)
 }
+
+private func lidClosed() -> Bool { readLidState() == .closed }
 
 private func fmtDuration(_ seconds: Int) -> String {
     let s = max(0, seconds)
@@ -107,44 +61,13 @@ private func fmtDuration(_ seconds: Int) -> String {
     return String(format: "%d초", sec)
 }
 
-private func nowEpoch() -> Int { Int(Date().timeIntervalSince1970) }
-
-private func copyResource(_ name: String, ext: String, to destination: String) -> Bool {
-    guard let bundled = Bundle.main.path(forResource: name, ofType: ext),
-          let data = try? Data(contentsOf: URL(fileURLWithPath: bundled)) else {
-        return false
-    }
-    do {
-        try data.write(to: URL(fileURLWithPath: destination), options: .atomic)
-    } catch {
-        return false
-    }
-    _ = shell("chmod 755 \(appleQuote(destination))")
-    return FileManager.default.isExecutableFile(atPath: destination)
-}
-
-private func installHelpers() -> String? {
-    if !copyResource("watchdog", ext: "sh", to: watchdogCopyPath) {
-        return "앱 안의 watchdog.sh를 복사하지 못했습니다"
-    }
-    if !copyResource("daemonize", ext: "py", to: daemonizeCopyPath) {
-        return "앱 안의 daemonize.py를 복사하지 못했습니다"
-    }
-    if !FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") {
-        return "/usr/bin/python3 이 없습니다 · 명령줄 도구를 설치하세요"
-    }
-    return nil
-}
-
 private func bumpGeneration() -> Int {
-    let (_, out) = shell(
-        "G=$(( $(cat \(genPath) 2>/dev/null || echo 0) + 1 )); echo $G > \(genPath); echo $G"
-    )
-    return Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1
-}
-
-private func writeFile(_ path: String, _ text: String) {
-    try? text.write(toFile: path, atomically: true, encoding: .utf8)
+    let current = Int((try? String(contentsOfFile: genPath, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+    let next = current + 1
+    writeText(genPath, "\(next)\n")
+    chmod(genPath, 0o666)
+    return next
 }
 
 /// Watchdog writes `<epoch> <reason>` whenever it restores sleep.
@@ -155,15 +78,24 @@ private func readLastRevert() -> (epoch: Int, reason: String)? {
     return (epoch, String(parts[1]))
 }
 
-private func clockText(_ epoch: Int) -> String {
+/// closed_until from the running watchdog, so a relaunched app can show the countdown.
+private func readWatchdogClosedUntil() -> Int? {
+    guard let raw = try? String(contentsOfFile: uiStatePath, encoding: .utf8) else { return nil }
+    for line in raw.split(separator: "\n") where line.hasPrefix("closed_until=") {
+        return Int(line.dropFirst("closed_until=".count)).flatMap { $0 > 0 ? $0 : nil }
+    }
+    return nil
+}
+
+private let clockFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "ko_KR")
     formatter.dateFormat = "a h:mm"
-    return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
-}
+    return formatter
+}()
 
-private func killCaffeinate() {
-    _ = shell("test -f \(caffeinatePidPath) && kill $(cat \(caffeinatePidPath)) 2>/dev/null; rm -f \(caffeinatePidPath)")
+private func clockText(_ epoch: Int) -> String {
+    clockFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -186,13 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var stopBtn: NSButton?
     var errorLabel: NSTextField?
     var timer: Timer?
-    private var isSessionActive = false
+    /// Closed-lid timer: root watchdog owns `pmset disablesleep`.
+    private var closedRunning = false
+    /// Open-lid timer: an in-process IOPM assertion, no helper process.
+    private let openAssertion = IdleSleepAssertion()
     private var isStarting = false
     private var isStopping = false
     private var closedUntil: Int?
     private var openUntil: Int?
     private var openUnlimited = false
-    private var needsAdmin = false
+    /// `SleepDisabled` left on with no watchdog (seen at launch or after a failed 해제).
+    private var leftoverSleepDisabled = false
     private var lastError: String?
     private var lastLayoutKey = ""
     private var activity: NSObjectProtocol?
@@ -204,15 +140,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var updateBusy = false
     private var updateChecking = false
 
+    private var isSessionActive: Bool { closedRunning || openAssertion.isHeld }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildUI()
         restoreIfNeeded()
         checkForUpdatesIfDue()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        // Lets macOS coalesce wakeups with other timers.
+        timer.tolerance = 0.3
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowVisibilityChanged),
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -222,20 +166,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if isSessionActive || sleepDisabled() || caffeinateAlive() {
-            stopSession()
-            isSessionActive = false
-            endActivity()
+        openAssertion.release()
+        if closedRunning || leftoverSleepDisabled || watchdogPidAlive() {
+            stopClosedSession()
+            closedRunning = false
         }
+        endActivity()
         return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if isSessionActive || sleepDisabled() {
-            stopSession()
-        }
+        openAssertion.release()
         endActivity()
         timer?.invalidate()
+    }
+
+    private var windowVisible: Bool {
+        window?.occlusionState.contains(.visible) == true
+    }
+
+    @objc private func windowVisibilityChanged() {
+        if windowVisible {
+            updateStatusVisuals()
+            updateButtons()
+        }
     }
 
     func buildUI() {
@@ -410,75 +364,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrame(win, display: true, animate: animate)
     }
 
+
     func restoreIfNeeded() {
-        guard sleepDisabled() || caffeinateAlive() || watchdogAlive() else { return }
-        isSessionActive = true
-        sessionStartedAt = nowEpoch()
-        needsAdmin = sleepDisabled()
-        beginActivity()
+        if watchdogAlive() {
+            closedRunning = true
+            closedUntil = readWatchdogClosedUntil()
+            sessionStartedAt = nowEpoch()
+            beginActivity()
+        } else if pmsetSleepDisabled() {
+            leftoverSleepDisabled = true
+            lastError = "이전 잠자기 방지 설정이 남아 있습니다 · 해제를 눌러 되돌리세요"
+        }
         updateButtons()
         updateStatusVisuals()
     }
 
-    func stillTimed() -> Bool {
-        let now = nowEpoch()
-        if openUnlimited { return true }
-        if let until = closedUntil, until > now { return true }
-        if let until = openUntil, until > now { return true }
-        return false
-    }
-
+    /// Everything here is native (IOKit, kill(2), file reads): no process is spawned per second.
     func tick() {
-        if isSessionActive, !isStopping {
-            let alive = watchdogAlive() || sleepDisabled() || caffeinateAlive()
+        let now = nowEpoch()
+        if openAssertion.isHeld, !isStopping {
+            if thermalSerious() {
+                openAssertion.release()
+                openUntil = nil
+                openUnlimited = false
+                if !closedRunning {
+                    infoMessage = "과열이 감지돼 자동으로 해제했습니다 · \(clockText(now))"
+                    infoColor = .systemOrange
+                }
+            } else if !openUnlimited, let until = openUntil, now >= until {
+                openAssertion.release()
+                openUntil = nil
+                if !closedRunning {
+                    infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(now))"
+                    infoColor = .secondaryLabelColor
+                }
+            }
+        }
+        if closedRunning, !isStopping, !watchdogAlive() {
+            closedRunning = false
             let revert = readLastRevert().flatMap { $0.epoch >= sessionStartedAt ? $0 : nil }
-            if !alive, let revert, revert.reason.hasPrefix("thermal") {
-                endSessionState()
+            if let revert, revert.reason.hasPrefix("thermal") {
+                openAssertion.release()
+                openUntil = nil
+                openUnlimited = false
+                closedUntil = nil
                 lastError = nil
                 infoMessage = "과열이 감지돼 자동으로 해제했습니다 · \(clockText(revert.epoch))"
                 infoColor = .systemOrange
-            } else if !alive, !stillTimed() {
-                endSessionState()
+            } else if revert != nil || (closedUntil.map { now >= $0 } ?? true) {
+                closedUntil = nil
                 lastError = nil
-                infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(revert?.epoch ?? nowEpoch()))"
-                infoColor = .secondaryLabelColor
-            } else if !alive, stillTimed() {
-                lastError = "워치독이 응답하지 않습니다 · 해제 후 다시 시작하세요"
+                if !openAssertion.isHeld {
+                    infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(revert?.epoch ?? now))"
+                    infoColor = .secondaryLabelColor
+                }
+            } else {
+                closedUntil = nil
+                leftoverSleepDisabled = true
+                lastError = "워치독이 응답하지 않습니다 · 해제를 눌러 잠자기 설정을 되돌리세요"
             }
+        }
+        if !isSessionActive {
+            endActivity()
         }
         if pendingRelease != nil {
             maybePromptUpdate()
         } else if Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: lastUpdateCheckKey) > updateCheckInterval {
             checkForUpdatesIfDue()
         }
+        // Hidden or covered window: skip drawing and layout entirely.
+        guard windowVisible else { return }
         updateStatusVisuals()
         updateButtons()
-    }
-
-    private func endSessionState() {
-        isSessionActive = false
-        closedUntil = nil
-        openUntil = nil
-        openUnlimited = false
-        needsAdmin = false
-        endActivity()
     }
 
     func updateButtons() {
         let busy = isStarting || isStopping || updateBusy
         startBtn?.isEnabled = !isSessionActive && !busy
         startBtn?.isHidden = isSessionActive
-        stopBtn?.isEnabled = (isSessionActive || sleepDisabled() || caffeinateAlive()) && !busy
+        stopBtn?.isEnabled = (isSessionActive || leftoverSleepDisabled) && !busy
         closedSeg?.isEnabled = !isSessionActive && !busy
         openSeg?.isEnabled = !isSessionActive && !busy
     }
 
     func closedArmed() -> Bool {
-        guard let until = closedUntil else { return false }
+        guard closedRunning, let until = closedUntil else { return closedRunning && closedUntil == nil }
         return until > nowEpoch()
     }
 
     func openArmed() -> Bool {
+        guard openAssertion.isHeld else { return false }
         if openUnlimited { return true }
         guard let until = openUntil else { return false }
         return until > nowEpoch()
@@ -486,8 +461,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func paintModeCards() {
         let session = isSessionActive || isStarting || isStopping
+        let lidIsClosed = lidClosed()
         let closedLive = session && closedArmed()
-        let openLive = session && !lidClosed() && openArmed()
+        let openLive = session && !lidIsClosed && openArmed()
         let closedRemainText = closedUntil.map { fmtDuration($0 - nowEpoch()) } ?? ""
         let openRemainText: String = {
             if openUnlimited { return "무한" }
@@ -585,42 +561,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if closedSeconds == 0, openSeconds == 0 {
             errorLabel?.stringValue = "닫힘·열림이 모두 끔입니다 · 하나를 고르세요"
             errorLabel?.textColor = .systemRed
+            errorLabel?.isHidden = false
             return
         }
-        isStarting = true
         lastError = nil
         infoMessage = nil
         sessionStartedAt = nowEpoch()
+
+        guard closedSeconds > 0 else {
+            startOpen(openSeconds)
+            updateButtons()
+            updateStatusVisuals()
+            return
+        }
+
+        isStarting = true
         updateButtons()
         updateStatusVisuals()
-
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = self?.startSession(closedSeconds: closedSeconds, openSeconds: openSeconds)
-                ?? (false, "내부 오류")
+            let result = self?.startClosedSession(closedSeconds: closedSeconds) ?? (false, "내부 오류")
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isStarting = false
                 if result.0 {
-                    self.isSessionActive = true
-                    self.lastError = nil
-                    self.needsAdmin = closedSeconds > 0
-                    let now = nowEpoch()
-                    self.closedUntil = closedSeconds > 0 ? now + closedSeconds : nil
-                    if openSeconds < 0 {
-                        self.openUnlimited = true
-                        self.openUntil = nil
-                    } else if openSeconds > 0 {
-                        self.openUnlimited = false
-                        self.openUntil = now + openSeconds
-                    } else {
-                        self.openUnlimited = false
-                        self.openUntil = nil
-                    }
+                    self.closedRunning = true
+                    self.leftoverSleepDisabled = false
+                    self.closedUntil = nowEpoch() + closedSeconds
+                    self.startOpen(openSeconds)
                     self.beginActivity()
                 } else {
                     self.lastError = result.1
-                    self.errorLabel?.stringValue = result.1
-                    self.errorLabel?.textColor = .systemRed
                 }
                 self.updateButtons()
                 self.updateStatusVisuals()
@@ -628,23 +598,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func startOpen(_ openSeconds: Int) {
+        guard openSeconds != 0 else {
+            openUntil = nil
+            openUnlimited = false
+            return
+        }
+        guard openAssertion.hold(reason: "잠자기 방지: 뚜껑이 열렸을 때만 켜 두기") else {
+            lastError = "잠자기 방지 요청을 만들지 못했습니다"
+            return
+        }
+        openUnlimited = openSeconds < 0
+        openUntil = openSeconds > 0 ? nowEpoch() + openSeconds : nil
+        beginActivity()
+    }
+
     @objc func stopPressed() {
         guard !isStopping else { return }
         isStopping = true
         lastError = nil
+        openAssertion.release()
+        openUntil = nil
+        openUnlimited = false
+        let needsClosedStop = closedRunning || leftoverSleepDisabled || watchdogPidAlive()
         updateButtons()
         updateStatusVisuals()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.stopSession()
-            let stillDisabled = sleepDisabled()
-            let stillCaffeinated = caffeinateAlive()
+            var stillDisabled = false
+            if needsClosedStop {
+                self?.stopClosedSession()
+                stillDisabled = pmsetSleepDisabled()
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isStopping = false
-                self.endSessionState()
-                if stillDisabled || stillCaffeinated {
+                self.closedRunning = false
+                self.closedUntil = nil
+                self.endActivity()
+                if stillDisabled {
+                    self.leftoverSleepDisabled = true
                     self.lastError = "아직 잠자기 방지가 남아 있습니다 · 해제를 다시 눌러 주세요"
                 } else {
+                    self.leftoverSleepDisabled = false
                     self.infoMessage = "해제됨 · 잠자기 설정을 원래대로 되돌렸습니다 · \(clockText(nowEpoch()))"
                     self.infoColor = .secondaryLabelColor
                 }
@@ -654,89 +649,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startSession(closedSeconds: Int, openSeconds: Int) -> (Bool, String) {
-        try? FileManager.default.removeItem(atPath: stopPath)
-        if let helperError = installHelpers() {
-            return (false, helperError)
-        }
+    private func startClosedSession(closedSeconds: Int) -> (Bool, String) {
+        guard let exe = Bundle.main.executablePath else { return (false, "앱 실행 파일 경로를 찾지 못했습니다") }
+        unlink(stopPath)
         let gen = bumpGeneration()
-        let now = nowEpoch()
-        let closedUntilEpoch = closedSeconds > 0 ? now + closedSeconds : 0
-        let openUntilEpoch = openSeconds > 0 ? now + openSeconds : 0
-        if closedUntilEpoch > 0 {
-            writeFile(untilPath, "\(closedUntilEpoch)\n")
-        } else {
-            try? FileManager.default.removeItem(atPath: untilPath)
-        }
+        let until = nowEpoch() + closedSeconds
+        writeText(untilPath, "\(until)\n")
 
-        var args = "--gen \(gen) --closed-until \(closedUntilEpoch) --open-until \(openUntilEpoch)"
-        if openSeconds < 0 {
-            args += " --open-unlimited"
-        }
-        if closedSeconds > 0 {
-            args += " --sleepnow-if-closed"
-        }
-        // Force-quit or crash: watchdog restores sleep about a minute after the app disappears.
-        args += " --require-gui"
-
-        let launch = "/usr/bin/python3 \(daemonizeCopyPath) \(watchdogPidPath) /bin/bash \(watchdogCopyPath) \(args) >>\(watchdogLogPath) 2>&1"
-        if closedSeconds > 0 {
-            let script = """
-            #!/bin/bash
-            /usr/bin/pmset -a disablesleep 1 || exit 1
-            \(launch)
-            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-              PID=$(tr -d '[:space:]' < \(watchdogPidPath) 2>/dev/null)
-              if [ -n "$PID" ] && /bin/ps -p "$PID" -o pid= >/dev/null 2>&1; then
-                exit 0
-              fi
-              sleep 0.1
-            done
-            /usr/bin/pmset -a disablesleep 0
-            exit 1
-            """
-            writeFile(startScriptPath, script)
-            _ = shell("chmod 755 \(startScriptPath)")
-            let (ok, out) = adminShell("/bin/bash \(startScriptPath)")
-            if !ok {
-                let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.localizedCaseInsensitiveContains("User canceled")
-                    || trimmed.contains("-128") {
-                    return (false, "관리자 암호가 취소되었습니다")
-                }
-                return (false, trimmed.isEmpty ? "관리자 권한으로 워치독을 시작하지 못했습니다" : trimmed)
+        // pmset first: Clamshell Sleep is synchronous, so disablesleep must be on
+        // before the watchdog's first poll. Roll back if the watchdog never starts.
+        let launch = [
+            shellQuote(exe), "--watchdog", "--daemonize",
+            "--gen", "\(gen)", "--closed-until", "\(until)", "--sleepnow-if-closed",
+            "--gui-pid", "\(getpid())", "--pidfile", watchdogPidPath
+        ].joined(separator: " ")
+        let script = """
+        #!/bin/bash
+        /bin/rm -f \(watchdogPidPath)
+        /usr/bin/pmset -a disablesleep 1 || exit 1
+        \(launch) >>\(watchdogLogPath) 2>&1
+        for i in $(/usr/bin/seq 1 30); do
+          PID=$(/usr/bin/tr -d '[:space:]' < \(watchdogPidPath) 2>/dev/null)
+          if [ -n "$PID" ] && /bin/kill -0 "$PID" 2>/dev/null; then
+            exit 0
+          fi
+          /bin/sleep 0.1
+        done
+        /usr/bin/pmset -a disablesleep 0
+        echo "워치독이 시작되지 않았습니다"
+        exit 1
+        """
+        writeText(startScriptPath, script)
+        chmod(startScriptPath, 0o755)
+        let (ok, out) = adminShell("/bin/bash \(startScriptPath)")
+        if !ok {
+            let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.localizedCaseInsensitiveContains("User canceled") || trimmed.contains("-128") {
+                return (false, "관리자 암호가 취소되었습니다")
             }
-            return (true, "")
+            return (false, trimmed.isEmpty ? "관리자 권한으로 워치독을 시작하지 못했습니다" : trimmed)
         }
-
-        let (status, out) = shell(launch)
-        for _ in 0..<15 {
-            if watchdogAlive() { return (true, "") }
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        if watchdogAlive() { return (true, "") }
-        let logTail = (try? String(contentsOfFile: watchdogLogPath, encoding: .utf8))?
-            .split(separator: "\n").suffix(3).joined(separator: " · ") ?? out
-        return (false, status == 0
-                ? "워치독 프로세스가 살아 있지 않습니다 · \(logTail)"
-                : "워치독 실행 실패 · \(logTail)")
+        return (true, "")
     }
 
-    private func stopSession() {
-        writeFile(stopPath, "1\n")
-        killCaffeinate()
-        for _ in 0..<30 {
-            if !watchdogAlive(), !sleepDisabled() { break }
+    /// The watchdog polls every 2 s, so the stop file normally lands within that window.
+    private func stopClosedSession() {
+        writeText(stopPath, "1\n")
+        for _ in 0..<40 {
+            if !watchdogPidAlive() { break }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        if sleepDisabled() {
-            _ = adminShell("/usr/bin/pmset -a disablesleep 0; exit 0")
-        }
-        if watchdogAlive() {
+        if watchdogPidAlive() {
             _ = bumpGeneration()
         }
-        try? FileManager.default.removeItem(atPath: untilPath)
-        try? FileManager.default.removeItem(atPath: stopPath)
+        if pmsetSleepDisabled() {
+            _ = adminShell("/usr/bin/pmset -a disablesleep 0; exit 0")
+        }
+        unlink(untilPath)
+        unlink(stopPath)
     }
 
     // MARK: - Update
@@ -877,6 +847,10 @@ enum LidguardApp {
     static let delegate = AppDelegate()
 
     static func main() {
+        let args = Array(CommandLine.arguments.dropFirst())
+        if args.first == "--watchdog" {
+            exit(Watchdog.main(args))
+        }
         let app = NSApplication.shared
         app.delegate = delegate
         let menu = NSMenu()

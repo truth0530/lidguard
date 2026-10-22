@@ -1,14 +1,14 @@
-# 잠자기 방지 (lidguard) 1.5.0
+# 잠자기 방지 (lidguard) 1.6.0
 
 뚜껑 닫힘/열림 유지 시간을 따로 두고, 시간이 끝나면 실제로 잠자기로 돌아갑니다.
 
 ## 동작
 
-- **뚜껑을 닫아도 켜 두기**: 시작 즉시 `pmset disablesleep 1`. 뚜껑이 아직 열려 있어도 켭니다. Apple Silicon은 뚜껑을 닫는 순간 `Clamshell Sleep`이라, 닫힌 뒤에 켜면 이미 늦습니다. 끝나면 덮개가 닫혀 있으면 `sleepnow`.
-- **뚜껑이 열렸을 때만 켜 두기**: `caffeinate`로만 유지. **끔**이면 화면·시스템 잠자기를 막지 않습니다.
+- **뚜껑을 닫아도 켜 두기**: 시작 즉시 `pmset disablesleep 1`. 뚜껑이 아직 열려 있어도 켭니다. Apple Silicon은 뚜껑을 닫는 순간 `Clamshell Sleep`이라, 닫힌 뒤에 켜면 이미 늦습니다. 끝나면 덮개가 닫혀 있으면 `sleepnow`. 관리자 권한이 필요해 같은 실행 파일의 감시 모드(`lidguard --watchdog`)가 root로 따로 돌며 시간을 지킵니다.
+- **뚜껑이 열렸을 때만 켜 두기**: 앱 안에서 `PreventUserIdleSystemSleep` 요청(`caffeinate -i`와 같은 효과)을 잡습니다. 별도 프로그램이나 관리자 암호가 필요 없고, 앱이 꺼지면 macOS가 즉시 풀어 줍니다. 뚜껑을 닫으면 평소처럼 잠들고, 다시 열면 남은 시간 동안 이어집니다. **끔**이면 화면·시스템 잠자기를 막지 않습니다.
 - 닫힘 유지가 켜져 있는 동안은 화면 자동꺼짐도 막힙니다. 창을 닫거나 종료하면 워치독이 `disablesleep`을 되돌립니다.
 - 앱을 강제 종료하거나 앱이 죽어도, 워치독이 앱이 사라진 것을 보고 약 1분 안에 잠자기를 되돌립니다.
-- CPU 속도 제한이 80% 밑으로 떨어지면(과열) 남은 시간과 관계없이 바로 해제합니다.
+- macOS 과열 상태가 `serious` 이상이면 남은 시간과 관계없이 바로 해제합니다.
 - 해제되면 창에 이유와 시각이 남습니다: 직접 해제, 시간 종료, 과열.
 
 ## 설치와 업데이트
@@ -46,10 +46,20 @@
 - 닫힘 유지 중에는 "가방에 넣기 전에 남은 시간을 확인하세요" 안내를 보여준다.
 - GitHub Releases 기반 자동 업데이트.
 
+## 1.6.0 가볍게
+
+- 화면 갱신(1초)에서 셸을 띄우던 확인을 모두 네이티브로 바꿨다. 뚜껑 상태와 `SleepDisabled`는 IOKit `IOPMrootDomain`에서, 프로세스 생존은 `kill(pid, 0)`(EPERM은 살아 있음)로 읽는다. 1초마다 실행하던 외부 프로그램 약 10개가 0개가 됐고, 뚜껑 상태 한 번 읽기가 약 19ms에서 약 17µs로 줄었다.
+- 창이 가려지거나 최소화되면 그리기와 레이아웃을 건너뛴다. 타이머에 여유(tolerance)를 줘 macOS가 깨우기를 묶을 수 있게 했다.
+- 열림 모드는 `caffeinate`와 감시 프로세스 대신 앱 안 IOPM 요청 하나로 끝난다.
+- 감시 스크립트(bash)와 `daemonize.py`(python)를 없애고, 같은 실행 파일의 Swift 감시 모드로 옮겼다. `POSIX_SPAWN_SETSID`로 관리자 셸과 수명을 끊는다. `pmset`은 켤 때 한 번, 끌 때 한 번만 실행하고, 과열은 `ProcessInfo.thermalState`로 판단한다. 2초 간격이라 해제가 빨라졌고, SIGTERM을 받아도 잠자기를 되돌린다. 같은 조건(10초, 1초 간격)에서 CPU 시간 0.47초→0.04초, `pmset` 실행 22회→2회.
+- 강제 종료 감지는 앱 이름(`pgrep`) 대신 앱 PID로 한다.
+- 업데이트 확인은 임시(ephemeral) 네트워크 세션을 쓰고 끝나면 닫는다. 빌드는 `-dead_strip`과 `strip -x`.
+
 ## 개발
 
 ```bash
-bash tests/test_watchdog.sh
 bash scripts/build.sh
+bash tests/test_watchdog.sh   # 가짜 pmset·뚜껑·과열로 감시 모드 14가지 시나리오
+bash tests/test_native.sh     # 실제 Mac에서 IOKit·kill·IOPM 요청·호출 비용 확인
 bash scripts/release.sh [노트파일]   # Info.plist 버전으로 v태그 릴리스, zip + sha256 업로드
 ```

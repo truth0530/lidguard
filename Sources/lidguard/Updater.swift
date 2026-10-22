@@ -1,4 +1,3 @@
-import AppKit
 import CryptoKit
 import Foundation
 
@@ -44,7 +43,10 @@ private func fetchData(_ url: URL, timeout: TimeInterval) -> Result<Data, Error>
     request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
     let done = DispatchSemaphore(value: 0)
     var result: Result<Data, Error> = .failure(UpdateFailure("응답이 없습니다"))
-    URLSession.shared.dataTask(with: request) { data, response, error in
+    // Ephemeral and invalidated after use: no cache or connection pool stays resident.
+    let session = URLSession(configuration: .ephemeral)
+    defer { session.finishTasksAndInvalidate() }
+    session.dataTask(with: request) { data, response, error in
         if let error {
             result = .failure(error)
         } else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
