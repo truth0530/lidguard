@@ -17,8 +17,11 @@ private let updateCheckInterval: TimeInterval = 24 * 60 * 60
 
 private let closedDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
 private let closedLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간"]
-/// Closed-lid 무한 is offered only with 전원 연결 중일 때만: unplugging always ends the awake state.
+/// The 7th closed-lid segment: 무한 with 전원 연결 시만 (unplugging always ends it),
+/// otherwise 6시간. The segment count never changes.
 private let closedUnlimitedLabel = "무한"
+private let closedLongLabel = "6시간"
+private let closedLongSeconds = 6 * 60 * 60
 private let openDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, -1]
 private let openLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간", "무한"]
 
@@ -254,11 +257,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return mark
         }
         func headerRow(accent: NSView, title: NSTextField, badge: NSTextField) -> NSStackView {
-            let row = NSStackView(views: [accent, title, badge])
+            // Title pinned left; an explicit spacer absorbs the free width so the
+            // title never drifts when the badge or font size changes.
+            let fill = NSView()
+            fill.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            fill.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let row = NSStackView(views: [accent, title, fill, badge])
             row.orientation = .horizontal
             row.alignment = .centerY
             row.spacing = 8
-            title.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            title.alignment = .left
+            title.setContentHuggingPriority(.required, for: .horizontal)
             badge.setContentHuggingPriority(.required, for: .horizontal)
             badge.alignment = .right
             badge.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -288,7 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedRemain.isHidden = true
         self.closedRemain = closedRemain
         let startsACOnly = UserDefaults.standard.bool(forKey: acOnlyKey)
-        let closedSeg = NSSegmentedControl(labels: closedLabels + (startsACOnly ? [closedUnlimitedLabel] : []),
+        let closedSeg = NSSegmentedControl(labels: closedLabels + [startsACOnly ? closedUnlimitedLabel : closedLongLabel],
                                            trackingMode: .selectOne, target: nil, action: nil)
         closedSeg.segmentStyle = .capsule
         closedSeg.controlSize = .regular
@@ -332,17 +341,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                seg: openSeg, accent: openAccent)
         self.openCard = openCard
 
-        // Sits at the right end of the closed-lid header, where 무한 appears.
-        // Hidden during a session; the header badge takes that spot.
+        // Its own row above both sections, right-aligned. Stays visible (disabled)
+        // during a session so the layout never shifts.
         let acOnly = NSButton(checkboxWithTitle: "전원 연결 시만", target: self, action: #selector(acOnlyChanged))
         acOnly.controlSize = .small
         acOnly.font = NSFont.systemFont(ofSize: 11)
         acOnly.state = startsACOnly ? .on : .off
-        acOnly.toolTip = "배터리로 바뀌면 멈춥니다. 켜면 무한을 고를 수 있습니다."
+        acOnly.toolTip = "배터리로 바뀌면 멈춥니다. 켜면 6시간 대신 무한을 고를 수 있습니다."
         acOnly.setContentHuggingPriority(.required, for: .horizontal)
         acOnly.setContentCompressionResistancePriority(.required, for: .horizontal)
         self.acOnlyCheck = acOnly
-        (closedCard.arrangedSubviews.first as? NSStackView)?.addArrangedSubview(acOnly)
+        let topFill = NSView()
+        topFill.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        topFill.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let topBar = NSStackView(views: [topFill, acOnly])
+        topBar.orientation = .horizontal
+        topBar.alignment = .centerY
+        topBar.spacing = 0
 
         let rule = NSBox()
         rule.boxType = .separator
@@ -378,19 +393,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         errorLabel.isHidden = true
         self.errorLabel = errorLabel
 
-        let root = NSStackView(views: [closedCard, rule, openCard, buttons, errorLabel])
+        let root = NSStackView(views: [topBar, closedCard, rule, openCard, buttons, errorLabel])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 16
+        root.setCustomSpacing(6, after: topBar)
         root.setCustomSpacing(20, after: openCard)
         root.setCustomSpacing(8, after: buttons)
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 22, bottom: 14, right: 22)
+        root.edgeInsets = NSEdgeInsets(top: 10, left: 22, bottom: 14, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
         closedCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -44).isActive = true
         openCard.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         rule.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         buttons.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         errorLabel.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
+        topBar.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
 
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
@@ -428,6 +445,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             closedUntil = readWatchdogClosedUntil()
             closedUnlimited = readWatchdogFlag("closed_unlimited=1")
             sessionACOnly = readWatchdogFlag("ac_only=1")
+            // Show the running session's setting on the (disabled) checkbox.
+            acOnlyCheck?.state = sessionACOnly ? .on : .off
+            acOnlyChanged()
             sessionStartedAt = nowEpoch()
             beginActivity()
         } else if pmsetSleepDisabled() {
@@ -522,7 +542,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedSeg?.isEnabled = !isSessionActive && !busy
         openSeg?.isEnabled = !isSessionActive && !busy
         acOnlyCheck?.isEnabled = !isSessionActive && !busy
-        acOnlyCheck?.isHidden = isSessionActive || isStarting || isStopping
     }
 
     func closedArmed() -> Bool {
@@ -532,20 +551,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return until > nowEpoch()
     }
 
-    /// 전원 연결 중일 때만 toggles the closed-lid 무한 segment.
+    /// 전원 연결 시만 relabels the last closed-lid segment: 무한 ↔ 6시간. Same count, same selection.
     @objc func acOnlyChanged() {
         let on = acOnlyCheck?.state == .on
         UserDefaults.standard.set(on, forKey: acOnlyKey)
-        guard let seg = closedSeg else { return }
-        let labels = closedLabels + (on ? [closedUnlimitedLabel] : [])
-        let keep = seg.selectedSegment
-        seg.segmentCount = labels.count
-        for (index, text) in labels.enumerated() {
-            seg.setLabel(text, forSegment: index)
-            seg.setWidth(0, forSegment: index)
-        }
-        seg.selectedSegment = keep < labels.count ? keep : closedLabels.count - 1
-        sizeWindow(animate: false)
+        closedSeg?.setLabel(on ? closedUnlimitedLabel : closedLongLabel, forSegment: closedLabels.count)
     }
 
     func openArmed() -> Bool {
@@ -658,9 +668,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isStarting, !isSessionActive, !updateBusy else { return }
         let closedIdx = max(0, closedSeg?.selectedSegment ?? 3)
         let openIdx = max(0, openSeg?.selectedSegment ?? 0)
-        // Index past the fixed list is 무한 (-1), present only while 전원 연결 중일 때만 is on.
+        // The last segment is 무한 (-1) with 전원 연결 시만, otherwise 6시간.
         let acOnlyNow = acOnlyCheck?.state == .on
-        let closedSeconds = closedIdx < closedDurations.count ? closedDurations[closedIdx] : (acOnlyNow ? -1 : closedDurations.last!)
+        let closedSeconds = closedIdx < closedDurations.count ? closedDurations[closedIdx] : (acOnlyNow ? -1 : closedLongSeconds)
         let openSeconds = openDurations[min(openIdx, openDurations.count - 1)]
         if closedSeconds == 0, openSeconds == 0 {
             errorLabel?.stringValue = "닫힘·열림이 모두 끔입니다 · 하나를 고르세요"
