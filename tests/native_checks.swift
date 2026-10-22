@@ -60,7 +60,11 @@ let pressure = readMemoryPressure()
 check("memory pressure readable", true, "\(pressure)")
 let monitorUnderTest = SystemMonitor()
 monitorUnderTest.start()
-monitorUnderTest.sampleCPU()
+monitorUnderTest.sample()
+let freePercent = readMemoryFreePercent()
+check("memory free percent in 0...100", freePercent.map { (0...100).contains($0) } ?? false,
+      "free=\(freePercent.map(String.init) ?? "nil")%")
+check("SystemMonitor memoryFree set", monitorUnderTest.memoryFree != nil)
 check("SystemMonitor battery matches batteryPercent", monitorUnderTest.battery.percent == batteryPercent())
 let cpuCostStart = Date()
 for _ in 0..<2000 { _ = readCPUTicks() }

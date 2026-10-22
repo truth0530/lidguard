@@ -31,6 +31,19 @@ func readMemoryPressure() -> MemoryPressure {
     }
 }
 
+/// Percent of memory the kernel can hand out right now (the "free percentage"
+/// that `memory_pressure` prints). Shown as 여유 % because macOS fills spare RAM
+/// with cache, so a "used %" would always look high.
+func readMemoryFreePercent() -> Int? {
+    var level: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    guard sysctlbyname("kern.memorystatus_level", &level, &size, nil, 0) == 0,
+          (0...100).contains(level) else {
+        return nil
+    }
+    return Int(level)
+}
+
 struct CPUTicks {
     let busy: UInt64
     let total: UInt64
@@ -72,6 +85,7 @@ final class SystemMonitor {
     private(set) var thermal: ProcessInfo.ThermalState = .nominal
     private(set) var memory: MemoryPressure = .normal
     private(set) var cpu: Int?
+    private(set) var memoryFree: Int?
     /// Called on the main thread after battery, thermal or memory changes.
     var onChange: (() -> Void)?
 
@@ -84,6 +98,7 @@ final class SystemMonitor {
         readBattery()
         thermal = ProcessInfo.processInfo.thermalState
         memory = readMemoryPressure()
+        memoryFree = readMemoryFreePercent()
         lastTicks = readCPUTicks()
 
         powerChangeHandler = { [weak self] in
@@ -123,8 +138,10 @@ final class SystemMonitor {
         battery = BatteryReading(percent: batteryPercent(), onAC: onACPower())
     }
 
-    /// Updates `cpu` from the change since the previous sample.
-    func sampleCPU() {
+    /// Called once a second while the window is visible: CPU since the previous
+    /// sample and the current memory free percentage (one sysctl each).
+    func sample() {
+        memoryFree = readMemoryFreePercent()
         guard let now = readCPUTicks() else { return }
         if let last = lastTicks, let value = cpuPercent(from: last, to: now) {
             cpu = value

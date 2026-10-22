@@ -398,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let batteryItem = statusItem("클릭하면 배터리 설정 열기") { [weak self] in self?.openBatterySettings() }
         let thermalItem = statusItem("macOS 발열 단계 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
         let cpuItem = statusItem("전체 CPU 사용률 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
-        let memoryItem = statusItem("macOS 메모리 압박 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
+        let memoryItem = statusItem("지금 바로 쓸 수 있는 메모리 · 색은 macOS 메모리 압력 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
         let batteryDot = dot()
         self.batteryItem = batteryItem
         self.batteryDot = batteryDot
@@ -415,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let topFill = NSView()
         topFill.setContentHuggingPriority(.defaultLow, for: .horizontal)
         topFill.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let topBar = NSStackView(views: [status, topFill, acOnly])
+        let topBar = NSStackView(views: [topFill, acOnly])
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
         topBar.spacing = 0
@@ -454,13 +454,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         errorLabel.isHidden = true
         self.errorLabel = errorLabel
 
-        let root = NSStackView(views: [topBar, closedCard, rule, openCard, buttons, errorLabel])
+        // Status line sits at the very bottom, under the status message.
+        let root = NSStackView(views: [topBar, closedCard, rule, openCard, buttons, errorLabel, status])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 16
         root.setCustomSpacing(6, after: topBar)
         root.setCustomSpacing(20, after: openCard)
         root.setCustomSpacing(8, after: buttons)
+        root.setCustomSpacing(8, after: errorLabel)
         root.edgeInsets = NSEdgeInsets(top: 10, left: 22, bottom: 14, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
         closedCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -44).isActive = true
@@ -591,7 +593,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Hidden or covered window: skip drawing and layout entirely.
         guard windowVisible else { return }
-        monitor.sampleCPU()
+        monitor.sample()
         updateMonitorLine()
         updateStatusVisuals()
         updateButtons()
@@ -1059,16 +1061,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cpuItem?.textColor = .secondaryLabelColor
         }
 
+        // Number: free %. Color: macOS memory pressure level, same as Activity Monitor.
+        let pressureWord: String
         switch monitor.memory {
         case .critical:
-            memoryItem?.stringValue = "메모리 부족"
+            pressureWord = "부족"
             memoryItem?.textColor = .systemRed
         case .warning:
-            memoryItem?.stringValue = "메모리 주의"
+            pressureWord = "주의"
             memoryItem?.textColor = .systemOrange
         case .normal:
-            memoryItem?.stringValue = "메모리 여유"
+            pressureWord = "여유"
             memoryItem?.textColor = .secondaryLabelColor
+        }
+        if let free = monitor.memoryFree {
+            memoryItem?.stringValue = "메모리 여유 \(free)%"
+        } else {
+            memoryItem?.stringValue = "메모리 \(pressureWord)"
         }
     }
 
