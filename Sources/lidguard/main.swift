@@ -295,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedSeg.selectedSegment = 3
         closedSeg.setContentHuggingPriority(.defaultLow, for: .horizontal)
         self.closedSeg = closedSeg
-        let closedNote = label("켜면 화면 자동꺼짐도 같이 막힙니다 · 과열되면 자동으로 풀립니다", size: 11, weight: .regular)
+        let closedNote = label("화면 자동꺼짐도 함께 막힙니다", size: 11, weight: .regular)
         closedNote.textColor = .secondaryLabelColor
         self.closedNote = closedNote
         let closedLiveNote = label("타이머가 끝나거나 과열되면 잠자기로 돌아갑니다.", size: 11, weight: .regular)
@@ -332,18 +332,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                seg: openSeg, accent: openAccent)
         self.openCard = openCard
 
-        // Top-right switch. Checking it adds 무한 to the closed-lid timer.
-        let acOnly = NSButton(checkboxWithTitle: "전원 연결 중일 때만", target: self, action: #selector(acOnlyChanged))
-        acOnly.font = NSFont.systemFont(ofSize: 12)
+        // Sits at the right end of the closed-lid header, where 무한 appears.
+        // Hidden during a session; the header badge takes that spot.
+        let acOnly = NSButton(checkboxWithTitle: "전원 연결 시만", target: self, action: #selector(acOnlyChanged))
+        acOnly.controlSize = .small
+        acOnly.font = NSFont.systemFont(ofSize: 11)
         acOnly.state = startsACOnly ? .on : .off
-        acOnly.toolTip = "배터리로 바뀌면 잠시 멈추고, 뚜껑이 닫혀 있으면 바로 잠듭니다. 켜면 뚜껑을 닫아도 켜 두기에 무한을 고를 수 있습니다."
+        acOnly.toolTip = "배터리로 바뀌면 멈춥니다. 켜면 무한을 고를 수 있습니다."
         acOnly.setContentHuggingPriority(.required, for: .horizontal)
+        acOnly.setContentCompressionResistancePriority(.required, for: .horizontal)
         self.acOnlyCheck = acOnly
-        let topSpacer = NSView()
-        topSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let topBar = NSStackView(views: [topSpacer, acOnly])
-        topBar.orientation = .horizontal
-        topBar.alignment = .centerY
+        (closedCard.arrangedSubviews.first as? NSStackView)?.addArrangedSubview(acOnly)
 
         let rule = NSBox()
         rule.boxType = .separator
@@ -379,19 +378,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         errorLabel.isHidden = true
         self.errorLabel = errorLabel
 
-        let root = NSStackView(views: [topBar, closedCard, rule, openCard, buttons, errorLabel])
+        let root = NSStackView(views: [closedCard, rule, openCard, buttons, errorLabel])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 16
-        root.setCustomSpacing(6, after: topBar)
         root.setCustomSpacing(20, after: openCard)
-        root.edgeInsets = NSEdgeInsets(top: 12, left: 22, bottom: 18, right: 22)
+        root.setCustomSpacing(8, after: buttons)
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 22, bottom: 14, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
         closedCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -44).isActive = true
         openCard.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         rule.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         buttons.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
-        topBar.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
+        errorLabel.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
 
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
@@ -523,6 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedSeg?.isEnabled = !isSessionActive && !busy
         openSeg?.isEnabled = !isSessionActive && !busy
         acOnlyCheck?.isEnabled = !isSessionActive && !busy
+        acOnlyCheck?.isHidden = isSessionActive || isStarting || isStopping
     }
 
     func closedArmed() -> Bool {
@@ -635,7 +635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             errorLabel?.textColor = .systemRed
             errorLabel?.isHidden = false
         } else if pausedForBattery {
-            errorLabel?.stringValue = "배터리 사용 중이라 잠시 멈췄습니다 · 전원을 연결하면 남은 시간 동안 다시 켜집니다"
+            errorLabel?.stringValue = "배터리 사용 중 · 전원을 연결하면 다시 켜집니다"
             errorLabel?.textColor = .systemOrange
             errorLabel?.isHidden = false
         } else if let infoMessage {
@@ -643,8 +643,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             errorLabel?.textColor = infoColor
             errorLabel?.isHidden = false
         } else {
-            errorLabel?.stringValue = ""
-            errorLabel?.isHidden = true
+            // Keep one empty line reserved so the window does not jump when a status appears.
+            errorLabel?.stringValue = " "
+            errorLabel?.isHidden = false
         }
         let key = "\(pausedForBattery)-\(isSessionActive)-\(isStarting)-\(isStopping)-\(lidClosed())-\(closedArmed())-\(openArmed())-\(errorLabel?.isHidden == true)-\(errorLabel?.stringValue.count ?? 0 > 40)"
         if key != lastLayoutKey {

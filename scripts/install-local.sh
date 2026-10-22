@@ -2,6 +2,7 @@
 # Commit the current work and replace the installed copies on this Mac with
 # the dist/ build. Old copies go to dist/old-installs/ (Terminal may not be
 # allowed to write to ~/.Trash). Push and release are separate.
+# Usage: bash scripts/install-local.sh ["commit message"]
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -33,7 +34,7 @@ git add -A Sources tests README.md Info.plist scripts || die "git add 실패"
 if git diff --cached --quiet; then
   echo "커밋할 변경 없음 (이미 커밋됨)"
 else
-  git commit -q -m "feat: 배터리 5% 이하 자동 해제, 전원 연결 체크박스 오른쪽 위와 닫힘 무한 ($BUILT)" || die "커밋 실패"
+  git commit -q -m "${1:-chore: 로컬 설치 ($BUILT)}" || die "커밋 실패"
 fi
 git log --oneline -1
 
