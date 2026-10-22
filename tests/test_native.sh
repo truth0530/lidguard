@@ -10,6 +10,7 @@ cp "$ROOT/tests/native_checks.swift" "$OUT/main.swift"
 swiftc -O -sdk "$(xcrun --show-sdk-path)" -target arm64-apple-macos12 \
   -framework IOKit \
   "$ROOT/Sources/lidguard/Native.swift" "$ROOT/Sources/lidguard/Updater.swift" \
+  "$ROOT/Sources/lidguard/Monitor.swift" \
   "$OUT/main.swift" -o "$OUT/native_checks"
 xattr -c "$OUT/native_checks" 2>/dev/null || true
 "$OUT/native_checks"

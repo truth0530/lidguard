@@ -44,6 +44,28 @@ check("batteryPercent matches pmset -g batt (±1)",
       "iokit=\(percent.map(String.init) ?? "nil") pmset=\(pmsetPercent.map(String.init) ?? "nil")")
 check("batteryLow false at current charge", batteryLow() == (!ac && (percent ?? 100) <= lowBatteryPercent))
 
+// Status line probes
+let ticksA = readCPUTicks()
+check("CPU ticks readable", ticksA != nil)
+var spin = 0.0
+for i in 0..<3_000_000 { spin += Double(i).squareRoot() }
+usleep(200_000)
+let ticksB = readCPUTicks()
+let cpuValue = (ticksA != nil && ticksB != nil) ? cpuPercent(from: ticksA!, to: ticksB!) : nil
+check("CPU percent in 0...100", cpuValue.map { (0...100).contains($0) } ?? false,
+      "cpu=\(cpuValue.map(String.init) ?? "nil") spin=\(Int(spin) % 10)")
+check("cpuPercent nil on wrapped counters",
+      cpuPercent(from: CPUTicks(busy: 10, total: 100), to: CPUTicks(busy: 5, total: 50)) == nil)
+let pressure = readMemoryPressure()
+check("memory pressure readable", true, "\(pressure)")
+let monitorUnderTest = SystemMonitor()
+monitorUnderTest.start()
+monitorUnderTest.sampleCPU()
+check("SystemMonitor battery matches batteryPercent", monitorUnderTest.battery.percent == batteryPercent())
+let cpuCostStart = Date()
+for _ in 0..<2000 { _ = readCPUTicks() }
+print(String(format: "cost readCPUTicks %.2f µs/call", Date().timeIntervalSince(cpuCostStart) / 2000 * 1_000_000))
+
 // Per-call cost of the per-second probes (old code spawned bash for each).
 let n = 2000
 var t = Date()

@@ -120,6 +120,19 @@ private func clockText(_ epoch: Int) -> String {
     clockFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
 }
 
+/// A plain label that acts like a link: pointing-hand cursor, click handler.
+final class LinkLabel: NSTextField {
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow?
     var closedCard: NSView?
@@ -137,6 +150,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var closedSeg: NSSegmentedControl?
     var openSeg: NSSegmentedControl?
     var acOnlyCheck: NSButton?
+    var batteryItem: NSTextField?
+    var batteryDot: NSTextField?
+    var thermalItem: NSTextField?
+    var cpuItem: NSTextField?
+    var memoryItem: NSTextField?
+    private let monitor = SystemMonitor()
     var startBtn: NSButton?
     var stopBtn: NSButton?
     var errorLabel: NSTextField?
@@ -178,6 +197,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildUI()
+        monitor.onChange = { [weak self] in
+            guard let self, self.windowVisible else { return }
+            self.updateMonitorLine()
+        }
+        monitor.start()
+        updateMonitorLine()
         restoreIfNeeded()
         checkForUpdatesIfDue()
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -221,6 +246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func windowVisibilityChanged() {
         if windowVisible {
+            monitor.rebaseCPU()
+            updateMonitorLine()
             updateStatusVisuals()
             updateButtons()
         }
@@ -351,10 +378,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         acOnly.setContentHuggingPriority(.required, for: .horizontal)
         acOnly.setContentCompressionResistancePriority(.required, for: .horizontal)
         self.acOnlyCheck = acOnly
+        // Status line on the left of the same row. Each item opens the macOS tool
+        // that has the details, so this app keeps no lists, graphs or history.
+        func statusItem(_ tip: String, _ action: @escaping () -> Void) -> LinkLabel {
+            let item = LinkLabel(labelWithString: "")
+            item.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            item.textColor = .secondaryLabelColor
+            item.lineBreakMode = .byClipping
+            item.toolTip = tip
+            item.onClick = action
+            return item
+        }
+        func dot() -> NSTextField {
+            let sep = NSTextField(labelWithString: "·")
+            sep.font = NSFont.systemFont(ofSize: 11)
+            sep.textColor = .tertiaryLabelColor
+            return sep
+        }
+        let batteryItem = statusItem("클릭하면 배터리 설정 열기") { [weak self] in self?.openBatterySettings() }
+        let thermalItem = statusItem("macOS 발열 단계 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
+        let cpuItem = statusItem("전체 CPU 사용률 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
+        let memoryItem = statusItem("macOS 메모리 압박 · 클릭하면 활성 상태 보기 열기") { [weak self] in self?.openActivityMonitor() }
+        let batteryDot = dot()
+        self.batteryItem = batteryItem
+        self.batteryDot = batteryDot
+        self.thermalItem = thermalItem
+        self.cpuItem = cpuItem
+        self.memoryItem = memoryItem
+        let status = NSStackView(views: [batteryItem, batteryDot, thermalItem, dot(), cpuItem, dot(), memoryItem])
+        status.orientation = .horizontal
+        status.alignment = .centerY
+        status.spacing = 4
+        status.setClippingResistancePriority(.defaultLow, for: .horizontal)
+        status.setHuggingPriority(.defaultLow, for: .horizontal)
+
         let topFill = NSView()
         topFill.setContentHuggingPriority(.defaultLow, for: .horizontal)
         topFill.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let topBar = NSStackView(views: [topFill, acOnly])
+        let topBar = NSStackView(views: [status, topFill, acOnly])
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
         topBar.spacing = 0
@@ -530,6 +591,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Hidden or covered window: skip drawing and layout entirely.
         guard windowVisible else { return }
+        monitor.sampleCPU()
+        updateMonitorLine()
         updateStatusVisuals()
         updateButtons()
     }
@@ -954,6 +1017,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = text
         alert.addButton(withTitle: "확인")
         alert.runModal()
+    }
+
+    // MARK: - Status line
+
+    func updateMonitorLine() {
+        let battery = monitor.battery
+        if let percent = battery.percent {
+            // The word says where power comes from: 전원 (adapter) or 배터리.
+            batteryItem?.stringValue = (battery.onAC ? "전원 " : "배터리 ") + "\(percent)%"
+            batteryItem?.textColor = battery.onAC ? .secondaryLabelColor
+                : percent <= lowBatteryPercent ? .systemRed
+                : percent < 20 ? .systemOrange : .secondaryLabelColor
+            batteryItem?.isHidden = false
+            batteryDot?.isHidden = false
+        } else {
+            batteryItem?.isHidden = true
+            batteryDot?.isHidden = true
+        }
+
+        switch monitor.thermal {
+        case .serious:
+            thermalItem?.stringValue = "발열 높음"
+            thermalItem?.textColor = .systemOrange
+        case .critical:
+            thermalItem?.stringValue = "발열 심각"
+            thermalItem?.textColor = .systemRed
+        case .fair:
+            thermalItem?.stringValue = "발열 보통"
+            thermalItem?.textColor = .secondaryLabelColor
+        default:
+            thermalItem?.stringValue = "발열 정상"
+            thermalItem?.textColor = .secondaryLabelColor
+        }
+
+        if let cpu = monitor.cpu {
+            cpuItem?.stringValue = "CPU \(cpu)%"
+            cpuItem?.textColor = cpu >= 90 ? .systemOrange : .secondaryLabelColor
+        } else {
+            cpuItem?.stringValue = "CPU –"
+            cpuItem?.textColor = .secondaryLabelColor
+        }
+
+        switch monitor.memory {
+        case .critical:
+            memoryItem?.stringValue = "메모리 부족"
+            memoryItem?.textColor = .systemRed
+        case .warning:
+            memoryItem?.stringValue = "메모리 주의"
+            memoryItem?.textColor = .systemOrange
+        case .normal:
+            memoryItem?.stringValue = "메모리 여유"
+            memoryItem?.textColor = .secondaryLabelColor
+        }
+    }
+
+    private func openActivityMonitor() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.ActivityMonitor") else {
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+    }
+
+    private func openBatterySettings() {
+        let pane: String
+        if #available(macOS 13, *) {
+            pane = "x-apple.systempreferences:com.apple.Battery-Settings.extension"
+        } else {
+            pane = "x-apple.systempreferences:com.apple.preference.battery"
+        }
+        if let url = URL(string: pane), NSWorkspace.shared.open(url) { return }
+        if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systempreferences") {
+            NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+        }
     }
 
     private func beginActivity() {
