@@ -157,4 +157,37 @@ fi
 grep -q "state unavailable" "$log"
 echo "ok missing ioreg is fail-safe"
 
+# 10) --require-gui: app force-quit (no lidguard process) reverts before deadline
+: >"$TMP/pmset.log"
+: >"$log"
+rm -f "$TMP/lidguard_last_revert"
+echo 1 >"$TMP/lidguard_gen"
+until=$(( $(date +%s) + 120 ))
+FAKE_PGREP_EXIT=1 FAKE_CLAMSHELL=Yes POLL=0 run_wd --until "$until" --gen 1 --mode closed --require-gui
+grep -q "revert: gui-exited" "$log"
+grep -q "disablesleep 0" "$TMP/pmset.log"
+grep -q " gui-exited$" "$TMP/lidguard_last_revert"
+echo "ok require-gui reverts after force-quit"
+
+# 11) --require-gui with the app alive keeps going until the deadline
+: >"$log"
+echo 1 >"$TMP/lidguard_gen"
+until=$(( $(date +%s) + 2 ))
+FAKE_PGREP_EXIT=0 FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed --require-gui
+if grep -q "gui-exited" "$log"; then
+  echo "fail: reverted while app alive" >&2
+  exit 1
+fi
+grep -q "revert: closed-idle" "$log"
+grep -q " closed-idle$" "$TMP/lidguard_last_revert"
+echo "ok require-gui keeps running while app alive"
+
+# 12) thermal revert is recorded for the GUI
+: >"$log"
+echo 1 >"$TMP/lidguard_gen"
+until=$(( $(date +%s) + 30 ))
+FAKE_THERM=50 FAKE_CLAMSHELL=Yes POLL=1 run_wd --until "$until" --gen 1 --mode closed
+grep -q " thermal CPU_Speed_Limit=50$" "$TMP/lidguard_last_revert"
+echo "ok thermal reason recorded"
+
 echo "ALL PASS"

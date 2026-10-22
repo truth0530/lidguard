@@ -179,6 +179,10 @@ revert() {
     log "skip revert, gen changed ($(read_gen) != $GEN)"
     return 0
   fi
+  # GUI reads this to tell 시간 종료 / 과열 / 해제 apart. 666 so a later
+  # non-root watchdog can overwrite a file a root watchdog created.
+  echo "$(now_epoch) $reason" >"$STATE_DIR/lidguard_last_revert" 2>/dev/null || true
+  chmod 666 "$STATE_DIR/lidguard_last_revert" 2>/dev/null || true
   if [ "$SLEEP_DISABLED" = "1" ] || [ "$CLOSED_UNTIL" -gt 0 ] 2>/dev/null; then
     clear_disablesleep
   fi

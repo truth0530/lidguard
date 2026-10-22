@@ -14,7 +14,7 @@ swiftc -O -parse-as-library \
   -sdk "$SDK" \
   -target arm64-apple-macos12 \
   -framework AppKit -framework Foundation \
-  "$ROOT/Sources/lidguard/main.swift" \
+  "$ROOT"/Sources/lidguard/*.swift \
   -o "$MACOS/lidguard"
 
 cp "$ROOT/Info.plist" "$DIST/Contents/Info.plist"
@@ -22,10 +22,11 @@ cp "$ROOT/scripts/watchdog.sh" "$RES/watchdog.sh"
 cp "$ROOT/scripts/daemonize.py" "$RES/daemonize.py"
 chmod 755 "$RES/watchdog.sh" "$RES/daemonize.py"
 
-ICON_SRC="/Users/kwangsunglee/Desktop/_바탕_정리_2026-08-11/04_도구앱/잠자기방지.app/Contents/Resources/AppIcon.icns"
+ICON_SRC="$ROOT/assets/AppIcon.icns"
 if [ -f "$ICON_SRC" ]; then
   cp "$ICON_SRC" "$RES/AppIcon.icns"
 fi
 
+xattr -cr "$DIST"
 codesign --force --sign - --timestamp=none "$DIST" >/dev/null
 echo "built $DIST"

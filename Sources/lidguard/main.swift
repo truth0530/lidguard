@@ -13,6 +13,9 @@ private let watchdogCopyPath = "\(stateDir)/lidguard_watchdog.sh"
 private let daemonizeCopyPath = "\(stateDir)/lidguard_daemonize.py"
 private let heartbeatPath = "\(stateDir)/lidguard_heartbeat"
 private let uiStatePath = "\(stateDir)/lidguard_ui"
+private let lastRevertPath = "\(stateDir)/lidguard_last_revert"
+private let lastUpdateCheckKey = "lastUpdateCheck"
+private let updateCheckInterval: TimeInterval = 24 * 60 * 60
 
 private let closedDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
 private let closedLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간"]
@@ -144,6 +147,21 @@ private func writeFile(_ path: String, _ text: String) {
     try? text.write(toFile: path, atomically: true, encoding: .utf8)
 }
 
+/// Watchdog writes `<epoch> <reason>` whenever it restores sleep.
+private func readLastRevert() -> (epoch: Int, reason: String)? {
+    guard let raw = try? String(contentsOfFile: lastRevertPath, encoding: .utf8) else { return nil }
+    let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 1)
+    guard parts.count == 2, let epoch = Int(parts[0]) else { return nil }
+    return (epoch, String(parts[1]))
+}
+
+private func clockText(_ epoch: Int) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "ko_KR")
+    formatter.dateFormat = "a h:mm"
+    return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+}
+
 private func killCaffeinate() {
     _ = shell("test -f \(caffeinatePidPath) && kill $(cat \(caffeinatePidPath)) 2>/dev/null; rm -f \(caffeinatePidPath)")
 }
@@ -156,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var openAccent: NSView?
     var closedHint: NSTextField?
     var closedNote: NSTextField?
+    var closedLiveNote: NSTextField?
     var openHint: NSTextField?
     var closedBadge: NSTextField?
     var openBadge: NSTextField?
@@ -177,11 +196,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastError: String?
     private var lastLayoutKey = ""
     private var activity: NSObjectProtocol?
+    private var infoMessage: String?
+    private var infoColor: NSColor = .secondaryLabelColor
+    private var sessionStartedAt = 0
+    private var pendingRelease: ReleaseInfo?
+    private var updatePrompting = false
+    private var updateBusy = false
+    private var updateChecking = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildUI()
         restoreIfNeeded()
+        checkForUpdatesIfDue()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -281,12 +308,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedSeg.selectedSegment = 3
         closedSeg.setContentHuggingPriority(.defaultLow, for: .horizontal)
         self.closedSeg = closedSeg
-        let closedNote = label("켜면 화면 자동꺼짐도 같이 막힙니다", size: 11, weight: .regular)
+        let closedNote = label("켜면 화면 자동꺼짐도 같이 막힙니다 · 과열되면 자동으로 풀립니다", size: 11, weight: .regular)
         closedNote.textColor = .secondaryLabelColor
         self.closedNote = closedNote
+        let closedLiveNote = label("가방에 넣기 전에 남은 시간을 확인하세요. 시간이 끝나면 잠자기로 돌아가고, 과열되면 바로 풀립니다.", size: 11, weight: .regular)
+        closedLiveNote.textColor = .secondaryLabelColor
+        closedLiveNote.lineBreakMode = .byWordWrapping
+        closedLiveNote.maximumNumberOfLines = 2
+        closedLiveNote.isHidden = true
+        self.closedLiveNote = closedLiveNote
         let closedCard = section(title: closedHint, badge: closedBadge, remain: closedRemain,
                                  seg: closedSeg, accent: closedAccent)
         closedCard.addArrangedSubview(closedNote)
+        closedCard.addArrangedSubview(closedLiveNote)
         self.closedCard = closedCard
 
         let openAccent = accentMark()
@@ -379,6 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func restoreIfNeeded() {
         guard sleepDisabled() || caffeinateAlive() || watchdogAlive() else { return }
         isSessionActive = true
+        sessionStartedAt = nowEpoch()
         needsAdmin = sleepDisabled()
         beginActivity()
         updateButtons()
@@ -394,25 +429,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func tick() {
-        if isSessionActive {
+        if isSessionActive, !isStopping {
             let alive = watchdogAlive() || sleepDisabled() || caffeinateAlive()
-            if !alive, !stillTimed() {
-                isSessionActive = false
-                closedUntil = nil
-                openUntil = nil
-                openUnlimited = false
-                needsAdmin = false
-                endActivity()
+            let revert = readLastRevert().flatMap { $0.epoch >= sessionStartedAt ? $0 : nil }
+            if !alive, let revert, revert.reason.hasPrefix("thermal") {
+                endSessionState()
+                lastError = nil
+                infoMessage = "과열이 감지돼 자동으로 해제했습니다 · \(clockText(revert.epoch))"
+                infoColor = .systemOrange
+            } else if !alive, !stillTimed() {
+                endSessionState()
+                lastError = nil
+                infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(revert?.epoch ?? nowEpoch()))"
+                infoColor = .secondaryLabelColor
             } else if !alive, stillTimed() {
                 lastError = "워치독이 응답하지 않습니다 · 해제 후 다시 시작하세요"
             }
+        }
+        if pendingRelease != nil {
+            maybePromptUpdate()
+        } else if Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: lastUpdateCheckKey) > updateCheckInterval {
+            checkForUpdatesIfDue()
         }
         updateStatusVisuals()
         updateButtons()
     }
 
+    private func endSessionState() {
+        isSessionActive = false
+        closedUntil = nil
+        openUntil = nil
+        openUnlimited = false
+        needsAdmin = false
+        endActivity()
+    }
+
     func updateButtons() {
-        let busy = isStarting || isStopping
+        let busy = isStarting || isStopping || updateBusy
         startBtn?.isEnabled = !isSessionActive && !busy
         startBtn?.isHidden = isSessionActive
         stopBtn?.isEnabled = (isSessionActive || sleepDisabled() || caffeinateAlive()) && !busy
@@ -455,6 +508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             accent?.isHidden = !live
             if hint === closedHint {
                 closedNote?.isHidden = session
+                closedLiveNote?.isHidden = !(session && armed)
             }
             if live {
                 badge?.stringValue = ""
@@ -507,11 +561,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             errorLabel?.stringValue = lastError
             errorLabel?.textColor = .systemRed
             errorLabel?.isHidden = false
+        } else if let infoMessage {
+            errorLabel?.stringValue = infoMessage
+            errorLabel?.textColor = infoColor
+            errorLabel?.isHidden = false
         } else {
             errorLabel?.stringValue = ""
             errorLabel?.isHidden = true
         }
-        let key = "\(isSessionActive)-\(isStarting)-\(isStopping)-\(lidClosed())-\(closedArmed())-\(openArmed())-\(errorLabel?.isHidden == true)"
+        let key = "\(isSessionActive)-\(isStarting)-\(isStopping)-\(lidClosed())-\(closedArmed())-\(openArmed())-\(errorLabel?.isHidden == true)-\(errorLabel?.stringValue.count ?? 0 > 40)"
         if key != lastLayoutKey {
             lastLayoutKey = key
             sizeWindow(animate: true)
@@ -519,7 +577,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func startPressed() {
-        guard !isStarting, !isSessionActive else { return }
+        guard !isStarting, !isSessionActive, !updateBusy else { return }
         let closedIdx = max(0, closedSeg?.selectedSegment ?? 3)
         let openIdx = max(0, openSeg?.selectedSegment ?? 0)
         let closedSeconds = closedDurations[min(closedIdx, closedDurations.count - 1)]
@@ -531,6 +589,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         isStarting = true
         lastError = nil
+        infoMessage = nil
+        sessionStartedAt = nowEpoch()
         updateButtons()
         updateStatusVisuals()
 
@@ -576,15 +636,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusVisuals()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.stopSession()
+            let stillDisabled = sleepDisabled()
+            let stillCaffeinated = caffeinateAlive()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isStopping = false
-                self.isSessionActive = false
-                self.closedUntil = nil
-                self.openUntil = nil
-                self.openUnlimited = false
-                self.needsAdmin = false
-                self.endActivity()
+                self.endSessionState()
+                if stillDisabled || stillCaffeinated {
+                    self.lastError = "아직 잠자기 방지가 남아 있습니다 · 해제를 다시 눌러 주세요"
+                } else {
+                    self.infoMessage = "해제됨 · 잠자기 설정을 원래대로 되돌렸습니다 · \(clockText(nowEpoch()))"
+                    self.infoColor = .secondaryLabelColor
+                }
                 self.updateButtons()
                 self.updateStatusVisuals()
             }
@@ -613,6 +676,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if closedSeconds > 0 {
             args += " --sleepnow-if-closed"
         }
+        // Force-quit or crash: watchdog restores sleep about a minute after the app disappears.
+        args += " --require-gui"
 
         let launch = "/usr/bin/python3 \(daemonizeCopyPath) \(watchdogPidPath) /bin/bash \(watchdogCopyPath) \(args) >>\(watchdogLogPath) 2>&1"
         if closedSeconds > 0 {
@@ -674,6 +739,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: stopPath)
     }
 
+    // MARK: - Update
+
+    private func checkForUpdatesIfDue() {
+        let last = UserDefaults.standard.double(forKey: lastUpdateCheckKey)
+        guard Date().timeIntervalSince1970 - last > updateCheckInterval else { return }
+        checkForUpdates(manual: false)
+    }
+
+    @objc func checkUpdatesMenu() {
+        checkForUpdates(manual: true)
+    }
+
+    private func checkForUpdates(manual: Bool) {
+        guard !updateChecking, !updateBusy else { return }
+        updateChecking = true
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastUpdateCheckKey)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = fetchLatestRelease()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updateChecking = false
+                switch result {
+                case .success(let release):
+                    if isVersion(release.version, newerThan: currentAppVersion()) {
+                        self.pendingRelease = release
+                        self.maybePromptUpdate()
+                    } else if manual {
+                        self.simpleAlert("최신 버전입니다", "지금 쓰는 버전은 \(currentAppVersion())입니다.")
+                    }
+                case .failure(let error):
+                    if manual {
+                        self.simpleAlert("업데이트를 확인하지 못했습니다", error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Never swap the app while sleep prevention is on; wait until the session ends.
+    private func maybePromptUpdate() {
+        guard let release = pendingRelease, !updatePrompting, !updateBusy,
+              !isSessionActive, !isStarting, !isStopping else { return }
+        if UserDefaults.standard.bool(forKey: "autoInstallUpdates") {
+            pendingRelease = nil
+            performUpdate(release)
+            return
+        }
+        updatePrompting = true
+        let alert = NSAlert()
+        alert.messageText = "새 버전 \(release.version)이 있습니다"
+        alert.informativeText = "지금 버전은 \(currentAppVersion())입니다. 업데이트하면 앱이 잠깐 닫혔다가 다시 열립니다."
+        alert.addButton(withTitle: "업데이트")
+        alert.addButton(withTitle: "나중에")
+        alert.addButton(withTitle: "변경 내용 보기")
+        let response = alert.runModal()
+        updatePrompting = false
+        pendingRelease = nil
+        switch response {
+        case .alertFirstButtonReturn:
+            performUpdate(release)
+        case .alertThirdButtonReturn:
+            NSWorkspace.shared.open(release.pageURL)
+        default:
+            break
+        }
+    }
+
+    private func performUpdate(_ release: ReleaseInfo) {
+        updateBusy = true
+        lastError = nil
+        infoMessage = "\(release.version) 내려받는 중…"
+        infoColor = .secondaryLabelColor
+        updateButtons()
+        updateStatusVisuals()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let prepared = prepareUpdate(release)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch prepared {
+                case .success(let newApp):
+                    if let error = launchInstaller(newApp: newApp) {
+                        self.updateFailed(error, release: release)
+                    } else {
+                        self.infoMessage = "\(release.version) 설치 중 · 곧 다시 열립니다"
+                        self.updateStatusVisuals()
+                        NSApp.terminate(nil)
+                    }
+                case .failure(let error):
+                    self.updateFailed(error, release: release)
+                }
+            }
+        }
+    }
+
+    private func updateFailed(_ error: Error, release: ReleaseInfo) {
+        updateBusy = false
+        infoMessage = nil
+        updateButtons()
+        updateStatusVisuals()
+        let alert = NSAlert()
+        alert.messageText = "업데이트하지 못했습니다"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "확인")
+        alert.addButton(withTitle: "릴리스 페이지 열기")
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(release.pageURL)
+        }
+    }
+
+    private func simpleAlert(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.addButton(withTitle: "확인")
+        alert.runModal()
+    }
+
     private func beginActivity() {
         guard activity == nil else { return }
         activity = ProcessInfo.processInfo.beginActivity(
@@ -701,6 +883,10 @@ enum LidguardApp {
         let appMenuItem = NSMenuItem()
         menu.addItem(appMenuItem)
         let appMenu = NSMenu()
+        let updateItem = NSMenuItem(title: "업데이트 확인…", action: #selector(AppDelegate.checkUpdatesMenu), keyEquivalent: "")
+        updateItem.target = delegate
+        appMenu.addItem(updateItem)
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "잠자기 방지 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
         app.mainMenu = menu
