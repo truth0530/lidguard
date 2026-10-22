@@ -336,8 +336,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stop.bezelStyle = .rounded
         stop.widthAnchor.constraint(equalToConstant: 84).isActive = true
         self.stopBtn = stop
-        let buttons = NSStackView(views: [start, stop])
+        // Version at the right end of the button row, so it is clear which copy is running.
+        let version = NSTextField(labelWithString: "v\(currentAppVersion())")
+        version.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        version.textColor = .tertiaryLabelColor
+        version.alignment = .right
+        version.setContentHuggingPriority(.required, for: .horizontal)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let buttons = NSStackView(views: [start, stop, spacer, version])
         buttons.orientation = .horizontal
+        buttons.alignment = .centerY
         buttons.spacing = 10
 
         let errorLabel = label("", size: 11, weight: .regular)
@@ -358,6 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -44).isActive = true
         openCard.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         rule.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
+        buttons.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
 
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false

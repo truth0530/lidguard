@@ -30,7 +30,7 @@ assertion.release()
 let gone = !runTool("/usr/bin/pmset", ["-g", "assertions"]).output.contains("lidguard test")
 check("assertion released", gone && !assertion.isHeld)
 
-check("version compare", isVersion("1.6.0", newerThan: "1.5.0") && !isVersion("1.5.0", newerThan: "1.5")
+check("version compare", isVersion("1.5.1", newerThan: "1.5.0") && !isVersion("1.5.0", newerThan: "1.5")
       && isVersion("v1.10.0", newerThan: "1.9.9"))
 
 let ac = onACPower()
