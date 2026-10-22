@@ -282,7 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let closedNote = label("켜면 화면 자동꺼짐도 같이 막힙니다 · 과열되면 자동으로 풀립니다", size: 11, weight: .regular)
         closedNote.textColor = .secondaryLabelColor
         self.closedNote = closedNote
-        let closedLiveNote = label("가방에 넣기 전에 남은 시간을 확인하세요. 시간이 끝나면 잠자기로 돌아가고, 과열되면 바로 풀립니다.", size: 11, weight: .regular)
+        let closedLiveNote = label("타이머가 끝나거나 과열되면 잠자기로 돌아갑니다.", size: 11, weight: .regular)
         closedLiveNote.textColor = .secondaryLabelColor
         closedLiveNote.lineBreakMode = .byWordWrapping
         closedLiveNote.maximumNumberOfLines = 2
