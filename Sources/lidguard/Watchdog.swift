@@ -3,7 +3,9 @@ import Foundation
 
 // Closed-lid watchdog. Runs as root from the same binary:
 //   lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed]
-//            [--gui-pid PID] [--pidfile PATH] [--ac-only] [--daemonize]
+//            [--gui-pid PID] [--pidfile PATH] [--ac-only [--closed-unlimited]] [--daemonize]
+// --closed-unlimited has no deadline and is accepted only with --ac-only, so
+// unplugging, overheating, 5% battery, the app exiting or 해제 always end it.
 // It owns `pmset disablesleep` for the closed-lid timer and must keep working
 // if the GUI dies. Each poll is a file stat plus an IOKit read; pmset runs only
 // on transitions (set once, clear once, optional sleepnow).
@@ -17,6 +19,7 @@ struct WatchdogOptions {
     var guiPid: pid_t?
     var pidfile: String?
     var acOnly = false
+    var closedUnlimited = false
     var daemonize = false
 }
 
@@ -55,6 +58,7 @@ enum Watchdog {
             case "--gui-pid": options.guiPid = Int32(value() ?? "")
             case "--pidfile": options.pidfile = value()
             case "--ac-only": options.acOnly = true
+            case "--closed-unlimited": options.closedUnlimited = true
             case "--daemonize": options.daemonize = true
             default:
                 FileHandle.standardError.write("unknown arg: \(args[i])\n".data(using: .utf8)!)
@@ -63,13 +67,17 @@ enum Watchdog {
             i += 1
         }
         guard !options.gen.isEmpty else { return nil }
+        if options.closedUnlimited, !options.acOnly {
+            FileHandle.standardError.write("--closed-unlimited requires --ac-only\n".data(using: .utf8)!)
+            return nil
+        }
         return options
     }
 
     static func main(_ rawArgs: [String]) -> Int32 {
         guard let options = parse(rawArgs) else {
             FileHandle.standardError.write(
-                "usage: lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed] [--gui-pid PID] [--pidfile PATH] [--ac-only] [--daemonize]\n"
+                "usage: lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed] [--gui-pid PID] [--pidfile PATH] [--ac-only [--closed-unlimited]] [--daemonize]\n"
                     .data(using: .utf8)!)
             return 2
         }
@@ -151,7 +159,23 @@ struct WatchdogLoop {
     }
 
     func closedActive(_ now: Int) -> Bool {
-        options.closedUntil > 0 && now < options.closedUntil
+        options.closedUnlimited || (options.closedUntil > 0 && now < options.closedUntil)
+    }
+
+    /// Seconds to sleep: one poll, or less so the deadline is hit exactly.
+    func pollWait(_ now: Int) -> Int {
+        options.closedUnlimited
+            ? Watchdog.pollSeconds
+            : max(0, min(Watchdog.pollSeconds, options.closedUntil - now))
+    }
+
+    func pause(_ now: Int) {
+        let wait = pollWait(now)
+        if wait > 0 {
+            sleep(UInt32(wait))
+        } else if Watchdog.pollSeconds == 0 {
+            usleep(50_000)
+        }
     }
 
     mutating func setDisableSleep() {
@@ -182,7 +206,7 @@ struct WatchdogLoop {
         // non-root process can overwrite a file a root watchdog created.
         writeText(Watchdog.lastRevertPath, "\(nowEpoch()) \(reason)\n")
         chmod(Watchdog.lastRevertPath, 0o666)
-        if sleepDisabled || options.closedUntil > 0 {
+        if sleepDisabled || options.closedUntil > 0 || options.closedUnlimited {
             clearDisableSleep()
         }
         unlink(Watchdog.untilPath)
@@ -203,6 +227,7 @@ struct WatchdogLoop {
         writeText(Watchdog.uiStatePath, """
         heartbeat=\(now)
         closed_until=\(options.closedUntil)
+        closed_unlimited=\(options.closedUnlimited ? 1 : 0)
         ac_only=\(options.acOnly ? 1 : 0)
         lid=\(lid.rawValue)
         phase=\(phase)
@@ -216,7 +241,7 @@ struct WatchdogLoop {
     }
 
     mutating func run() -> Int32 {
-        log("start gen=\(options.gen) closed_until=\(options.closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") ac_only=\(options.acOnly) poll=\(Watchdog.pollSeconds)")
+        log("start gen=\(options.gen) closed_until=\(options.closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") ac_only=\(options.acOnly) unlimited=\(options.closedUnlimited) poll=\(Watchdog.pollSeconds)")
         if closedActive(nowEpoch()), !options.acOnly || onACPower() {
             setDisableSleep()
         }
@@ -237,6 +262,12 @@ struct WatchdogLoop {
             let now = nowEpoch()
             if thermalSerious() {
                 revert("thermal \(thermalLabel())")
+                return 0
+            }
+            // macOS low-battery sleep may be blocked while disablesleep is on,
+            // so stop at 5% on battery instead of letting the Mac die in a bag.
+            if batteryLow() {
+                revert("battery-low \(batteryPercent() ?? -1)%")
                 return 0
             }
             if let gui = options.guiPid {
@@ -285,8 +316,7 @@ struct WatchdogLoop {
                     }
                 }
                 heartbeat(now, lid: lid == .unknown ? lastLid : lid, phase: "battery-paused")
-                let wait = max(0, min(Watchdog.pollSeconds, options.closedUntil - now))
-                if wait > 0 { sleep(UInt32(wait)) } else if Watchdog.pollSeconds == 0 { usleep(50_000) }
+                pause(now)
                 continue
             }
             if pausedForBattery {
@@ -305,12 +335,7 @@ struct WatchdogLoop {
             }
 
             // Wake exactly at the deadline instead of overshooting by a poll.
-            let wait = max(0, min(Watchdog.pollSeconds, options.closedUntil - now))
-            if wait > 0 {
-                sleep(UInt32(wait))
-            } else if Watchdog.pollSeconds == 0 {
-                usleep(50_000)
-            }
+            pause(now)
         }
     }
 }

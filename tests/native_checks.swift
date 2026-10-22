@@ -36,6 +36,13 @@ check("version compare", isVersion("1.5.1", newerThan: "1.5.0") && !isVersion("1
 let ac = onACPower()
 let pmsetSource = runTool("/usr/bin/pmset", ["-g", "batt"]).output
 check("onACPower matches pmset -g batt", ac == pmsetSource.contains("AC Power"), "ac=\(ac)")
+let percent = batteryPercent()
+let pmsetPercent = pmsetSource.range(of: #"(\d+)%"#, options: .regularExpression)
+    .map { Int(pmsetSource[$0].dropLast()) ?? -1 }
+check("batteryPercent matches pmset -g batt (±1)",
+      percent == nil ? pmsetPercent == nil : abs((percent ?? 0) - (pmsetPercent ?? -100)) <= 1,
+      "iokit=\(percent.map(String.init) ?? "nil") pmset=\(pmsetPercent.map(String.init) ?? "nil")")
+check("batteryLow false at current charge", batteryLow() == (!ac && (percent ?? 100) <= lowBatteryPercent))
 
 // Per-call cost of the per-second probes (old code spawned bash for each).
 let n = 2000

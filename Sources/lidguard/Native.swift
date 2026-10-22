@@ -93,6 +93,37 @@ func onACPower() -> Bool {
     return (type as String) != "Battery Power"
 }
 
+/// Below this, on battery, every keep-awake mode ends (fixed at 5%).
+let lowBatteryPercent = 5
+
+/// Internal battery charge in percent, nil on Macs without a battery.
+/// Test hook: LIDGUARD_FAKE_BATTERY_PERCENT.
+func batteryPercent() -> Int? {
+    if let fake = testOverride("LIDGUARD_FAKE_BATTERY_PERCENT") {
+        return Int(fake)
+    }
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else {
+        return nil
+    }
+    for source in list {
+        guard let desc = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
+              (desc["Type"] as? String) == "InternalBattery",
+              let current = desc["Current Capacity"] as? Int,
+              let maximum = desc["Max Capacity"] as? Int, maximum > 0 else {
+            continue
+        }
+        return current * 100 / maximum
+    }
+    return nil
+}
+
+/// On battery at or below 5%. Charging never counts as low.
+func batteryLow() -> Bool {
+    guard !onACPower(), let percent = batteryPercent() else { return false }
+    return percent <= lowBatteryPercent
+}
+
 /// EPERM means the process exists but belongs to another user (root watchdog).
 func pidAlive(_ pid: pid_t) -> Bool {
     guard pid > 0 else { return false }

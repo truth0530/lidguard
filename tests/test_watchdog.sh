@@ -13,6 +13,13 @@ if [ -z "${LIDGUARD_BIN:-}" ]; then
 fi
 BIN="$LIDGUARD_BIN"
 
+# On failure, say where and show the watchdog log instead of exiting silently.
+trap 'rc=$?; echo "fail: line $LINENO (exit $rc)" >&2; echo "--- watchdog log" >&2; cat "$TMP/lidguard_watchdog.log" >&2 2>/dev/null; echo "--- pmset calls" >&2; cat "$TMP/pmset.log" >&2 2>/dev/null' ERR
+
+# A freshly built binary can take over a second on its first launch (macOS
+# security check). Launch it once so timing-sensitive cases are not skewed.
+"$BIN" --watchdog >/dev/null 2>&1 || true
+
 fake_pmset="$TMP/pmset"
 log="$TMP/lidguard_watchdog.log"
 cat >"$fake_pmset" <<'EOF'
@@ -31,6 +38,7 @@ run_wd() {
   LIDGUARD_FAKE_CLAMSHELL="${FAKE_CLAMSHELL:-No}" \
   LIDGUARD_FAKE_POWER="${LIDGUARD_FAKE_POWER:-ac}" \
   LIDGUARD_FAKE_POWER_FILE="${LIDGUARD_FAKE_POWER_FILE:-}" \
+  LIDGUARD_FAKE_BATTERY_PERCENT="${LIDGUARD_FAKE_BATTERY_PERCENT:-80}" \
   "$BIN" --watchdog "$@"
 }
 
@@ -89,7 +97,7 @@ echo "ok stop-file"
 
 # 7) lid OPEN: set disablesleep 1 at once, clear on deadline, never sleepnow
 reset
-FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 1)" --sleepnow-if-closed
+FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 3)" --sleepnow-if-closed
 grep -q "sleepnow" "$TMP/pmset.log" && fail "sleepnow while lid open"
 grep -q "disablesleep 1" "$TMP/pmset.log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
@@ -98,7 +106,7 @@ echo "ok lid-open preemptive disablesleep"
 
 # 8) lid closed also sets disablesleep 1
 reset
-FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 1)"
+FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 3)"
 grep -q "disablesleep 1" "$TMP/pmset.log"
 grep -q "disablesleep 0" "$TMP/pmset.log"
 echo "ok lid-closed sets disablesleep"
@@ -169,7 +177,7 @@ echo "ok daemonize + stop within poll"
 
 # 15) --ac-only on battery from the start: never arms, stays paused, reverts at deadline
 reset
-LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 2)" --ac-only
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 3)" --ac-only
 grep -q "disablesleep 1" "$TMP/pmset.log" && fail "armed on battery with --ac-only"
 grep -q "power battery — pause" "$log"
 grep -q "phase=battery-paused" "$log"
@@ -178,7 +186,7 @@ echo "ok ac-only on battery stays paused"
 
 # 16) --ac-only: unplugging with the lid closed sends the Mac to sleep once
 reset
-LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 2)" --ac-only
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 3)" --ac-only
 grep -q "battery with lid closed — sleepnow" "$log"
 [ "$(grep -c "pmset sleepnow" "$TMP/pmset.log")" -eq 1 ] || fail "sleepnow not exactly once"
 echo "ok ac-only unplug with lid closed sleeps"
@@ -199,9 +207,60 @@ echo "ok ac-only pause and resume ($seq)"
 
 # 18) without --ac-only, battery changes nothing
 reset
-LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 2)"
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 3)"
 grep -q "pause" "$log" && fail "paused without --ac-only"
 grep -q "disablesleep 1" "$TMP/pmset.log"
 echo "ok battery ignored without ac-only"
+
+# 19) battery at 5% or lower on battery power ends the session
+reset
+LIDGUARD_FAKE_POWER=battery LIDGUARD_FAKE_BATTERY_PERCENT=5 FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 30)" --sleepnow-if-closed
+grep -q "revert: battery-low 5%" "$log"
+grep -q "disablesleep 0" "$TMP/pmset.log"
+grep -q "pmset sleepnow" "$TMP/pmset.log"
+grep -q " battery-low 5%$" "$TMP/lidguard_last_revert"
+echo "ok battery 5% reverts and sleeps"
+
+# 20) 4% while charging is not low
+reset
+LIDGUARD_FAKE_POWER=ac LIDGUARD_FAKE_BATTERY_PERCENT=4 FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 2)"
+grep -q "battery-low" "$log" && fail "battery-low while charging"
+grep -q "revert: closed-idle" "$log"
+echo "ok low battery ignored while charging"
+
+# 21) --closed-unlimited without --ac-only is refused
+reset
+rc=0
+run_wd --gen 1 --closed-until 0 --closed-unlimited 2>/dev/null || rc=$?
+[ "$rc" -eq 2 ] || fail "closed-unlimited without ac-only exited $rc"
+grep -q "disablesleep 1" "$TMP/pmset.log" && fail "armed without ac-only"
+echo "ok closed-unlimited needs ac-only"
+
+# 22) --closed-unlimited --ac-only keeps running with no deadline until 해제
+reset
+LIDGUARD_STATE_DIR="$TMP" LIDGUARD_POLL_SECONDS=1 LIDGUARD_PMSET="$fake_pmset" LIDGUARD_LOG="$log" \
+  LIDGUARD_FAKE_THERMAL=nominal LIDGUARD_FAKE_CLAMSHELL=Yes LIDGUARD_FAKE_POWER=ac LIDGUARD_FAKE_BATTERY_PERCENT=80 \
+  "$BIN" --watchdog --gen 1 --closed-until 0 --closed-unlimited --ac-only &
+WD=$!
+sleep 3
+kill -0 $WD || fail "unlimited watchdog exited early"
+grep -q "phase=lid-closed-awake" "$log"
+grep -q "closed_unlimited=1" "$TMP/lidguard_ui"
+touch "$TMP/lidguard_stop"
+wait $WD || true
+grep -q "revert: stop-file" "$log"
+[ "$(grep -c "disablesleep 1" "$TMP/pmset.log")" -eq 1 ] || fail "unlimited re-armed repeatedly"
+echo "ok closed-unlimited runs until stop"
+
+# 23) --closed-unlimited --ac-only: unplugging with the lid closed sleeps
+reset
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until 0 --closed-unlimited --ac-only &
+WD=$!
+sleep 2.5
+touch "$TMP/lidguard_stop"
+wait $WD || true
+grep -q "battery with lid closed — sleepnow" "$log"
+grep -q "disablesleep 1" "$TMP/pmset.log" && fail "armed on battery"
+echo "ok closed-unlimited pauses on battery"
 
 echo "ALL PASS"

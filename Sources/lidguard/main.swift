@@ -17,6 +17,8 @@ private let updateCheckInterval: TimeInterval = 24 * 60 * 60
 
 private let closedDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
 private let closedLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간"]
+/// Closed-lid 무한 is offered only with 전원 연결 중일 때만: unplugging always ends the awake state.
+private let closedUnlimitedLabel = "무한"
 private let openDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, -1]
 private let openLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간", "무한"]
 
@@ -88,9 +90,20 @@ private func readWatchdogClosedUntil() -> Int? {
     return nil
 }
 
-private func readWatchdogACOnly() -> Bool {
+private func readWatchdogFlag(_ line: String) -> Bool {
     guard let raw = try? String(contentsOfFile: uiStatePath, encoding: .utf8) else { return false }
-    return raw.split(separator: "\n").contains("ac_only=1")
+    return raw.split(separator: "\n").contains(Substring(line))
+}
+
+/// Status line for a watchdog revert reason.
+private func revertMessage(_ reason: String, at epoch: Int) -> (String, NSColor) {
+    if reason.hasPrefix("thermal") {
+        return ("과열이 감지돼 자동으로 해제했습니다 · \(clockText(epoch))", .systemOrange)
+    }
+    if reason.hasPrefix("battery-low") {
+        return ("배터리 \(lowBatteryPercent)% 이하라 자동으로 해제했습니다 · \(clockText(epoch))", .systemOrange)
+    }
+    return ("해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(epoch))", .secondaryLabelColor)
 }
 
 private let clockFormatter: DateFormatter = {
@@ -136,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isStarting = false
     private var isStopping = false
     private var closedUntil: Int?
+    private var closedUnlimited = false
     private var openUntil: Int?
     private var openUnlimited = false
     /// `SleepDisabled` left on with no watchdog (seen at launch or after a failed 해제).
@@ -273,7 +287,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedRemain.textColor = .labelColor
         closedRemain.isHidden = true
         self.closedRemain = closedRemain
-        let closedSeg = NSSegmentedControl(labels: closedLabels, trackingMode: .selectOne, target: nil, action: nil)
+        let startsACOnly = UserDefaults.standard.bool(forKey: acOnlyKey)
+        let closedSeg = NSSegmentedControl(labels: closedLabels + (startsACOnly ? [closedUnlimitedLabel] : []),
+                                           trackingMode: .selectOne, target: nil, action: nil)
         closedSeg.segmentStyle = .capsule
         closedSeg.controlSize = .regular
         closedSeg.selectedSegment = 3
@@ -316,11 +332,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                seg: openSeg, accent: openAccent)
         self.openCard = openCard
 
-        let acOnly = NSButton(checkboxWithTitle: "전원 연결 중일 때만 · 배터리로 바뀌면 잠시 멈춥니다", target: nil, action: nil)
+        // Top-right switch. Checking it adds 무한 to the closed-lid timer.
+        let acOnly = NSButton(checkboxWithTitle: "전원 연결 중일 때만", target: self, action: #selector(acOnlyChanged))
         acOnly.font = NSFont.systemFont(ofSize: 12)
-        acOnly.state = UserDefaults.standard.bool(forKey: acOnlyKey) ? .on : .off
-        acOnly.translatesAutoresizingMaskIntoConstraints = false
+        acOnly.state = startsACOnly ? .on : .off
+        acOnly.toolTip = "배터리로 바뀌면 잠시 멈추고, 뚜껑이 닫혀 있으면 바로 잠듭니다. 켜면 뚜껑을 닫아도 켜 두기에 무한을 고를 수 있습니다."
+        acOnly.setContentHuggingPriority(.required, for: .horizontal)
         self.acOnlyCheck = acOnly
+        let topSpacer = NSView()
+        topSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let topBar = NSStackView(views: [topSpacer, acOnly])
+        topBar.orientation = .horizontal
+        topBar.alignment = .centerY
 
         let rule = NSBox()
         rule.boxType = .separator
@@ -356,18 +379,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         errorLabel.isHidden = true
         self.errorLabel = errorLabel
 
-        let root = NSStackView(views: [closedCard, rule, openCard, acOnly, buttons, errorLabel])
+        let root = NSStackView(views: [topBar, closedCard, rule, openCard, buttons, errorLabel])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 16
-        root.setCustomSpacing(14, after: openCard)
-        root.setCustomSpacing(18, after: acOnly)
-        root.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 18, right: 22)
+        root.setCustomSpacing(6, after: topBar)
+        root.setCustomSpacing(20, after: openCard)
+        root.edgeInsets = NSEdgeInsets(top: 12, left: 22, bottom: 18, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
         closedCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -44).isActive = true
         openCard.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         rule.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
         buttons.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
+        topBar.widthAnchor.constraint(equalTo: closedCard.widthAnchor).isActive = true
 
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
@@ -403,7 +427,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if watchdogAlive() {
             closedRunning = true
             closedUntil = readWatchdogClosedUntil()
-            sessionACOnly = readWatchdogACOnly()
+            closedUnlimited = readWatchdogFlag("closed_unlimited=1")
+            sessionACOnly = readWatchdogFlag("ac_only=1")
             sessionStartedAt = nowEpoch()
             beginActivity()
         } else if pmsetSleepDisabled() {
@@ -418,14 +443,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func tick() {
         let now = nowEpoch()
         if openRunning, !isStopping {
-            if thermalSerious() {
+            let safetyReason: String? = thermalSerious() ? "thermal" : (batteryLow() ? "battery-low" : nil)
+            if let safetyReason {
                 openRunning = false
                 openAssertion.release()
                 openUntil = nil
                 openUnlimited = false
                 if !closedRunning {
-                    infoMessage = "과열이 감지돼 자동으로 해제했습니다 · \(clockText(now))"
-                    infoColor = .systemOrange
+                    let (message, color) = revertMessage(safetyReason, at: now)
+                    infoMessage = message
+                    infoColor = color
                 }
             } else if !openUnlimited, let until = openUntil, now >= until {
                 openRunning = false
@@ -447,21 +474,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if closedRunning, !isStopping, !watchdogAlive() {
             closedRunning = false
             let revert = readLastRevert().flatMap { $0.epoch >= sessionStartedAt ? $0 : nil }
-            if let revert, revert.reason.hasPrefix("thermal") {
+            let wasUnlimited = closedUnlimited
+            closedUnlimited = false
+            if let revert, revert.reason.hasPrefix("thermal") || revert.reason.hasPrefix("battery-low") {
+                // Safety reverts end the whole session, open-lid timer included.
                 openRunning = false
                 openAssertion.release()
                 openUntil = nil
                 openUnlimited = false
                 closedUntil = nil
                 lastError = nil
-                infoMessage = "과열이 감지돼 자동으로 해제했습니다 · \(clockText(revert.epoch))"
-                infoColor = .systemOrange
-            } else if revert != nil || (closedUntil.map { now >= $0 } ?? true) {
+                let (message, color) = revertMessage(revert.reason, at: revert.epoch)
+                infoMessage = message
+                infoColor = color
+            } else if revert != nil || (!wasUnlimited && (closedUntil.map { now >= $0 } ?? true)) {
                 closedUntil = nil
                 lastError = nil
                 if !openRunning {
-                    infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(revert?.epoch ?? now))"
-                    infoColor = .secondaryLabelColor
+                    let (message, color) = revertMessage(revert?.reason ?? "deadline", at: revert?.epoch ?? now)
+                    infoMessage = message
+                    infoColor = color
                 }
             } else {
                 closedUntil = nil
@@ -494,8 +526,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func closedArmed() -> Bool {
-        guard closedRunning, let until = closedUntil else { return closedRunning && closedUntil == nil }
+        guard closedRunning else { return false }
+        if closedUnlimited { return true }
+        guard let until = closedUntil else { return true }
         return until > nowEpoch()
+    }
+
+    /// 전원 연결 중일 때만 toggles the closed-lid 무한 segment.
+    @objc func acOnlyChanged() {
+        let on = acOnlyCheck?.state == .on
+        UserDefaults.standard.set(on, forKey: acOnlyKey)
+        guard let seg = closedSeg else { return }
+        let labels = closedLabels + (on ? [closedUnlimitedLabel] : [])
+        let keep = seg.selectedSegment
+        seg.segmentCount = labels.count
+        for (index, text) in labels.enumerated() {
+            seg.setLabel(text, forSegment: index)
+            seg.setWidth(0, forSegment: index)
+        }
+        seg.selectedSegment = keep < labels.count ? keep : closedLabels.count - 1
+        sizeWindow(animate: false)
     }
 
     func openArmed() -> Bool {
@@ -511,7 +561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let paused = pausedForBattery
         let closedLive = session && closedArmed() && !paused
         let openLive = session && !lidIsClosed && openArmed() && !paused
-        let closedRemainText = closedUntil.map { fmtDuration($0 - nowEpoch()) } ?? ""
+        let closedRemainText = closedUnlimited ? "무한" : (closedUntil.map { fmtDuration($0 - nowEpoch()) } ?? "")
         let openRemainText: String = {
             if openUnlimited { return "무한" }
             if let until = openUntil { return fmtDuration(until - nowEpoch()) }
@@ -607,7 +657,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isStarting, !isSessionActive, !updateBusy else { return }
         let closedIdx = max(0, closedSeg?.selectedSegment ?? 3)
         let openIdx = max(0, openSeg?.selectedSegment ?? 0)
-        let closedSeconds = closedDurations[min(closedIdx, closedDurations.count - 1)]
+        // Index past the fixed list is 무한 (-1), present only while 전원 연결 중일 때만 is on.
+        let acOnlyNow = acOnlyCheck?.state == .on
+        let closedSeconds = closedIdx < closedDurations.count ? closedDurations[closedIdx] : (acOnlyNow ? -1 : closedDurations.last!)
         let openSeconds = openDurations[min(openIdx, openDurations.count - 1)]
         if closedSeconds == 0, openSeconds == 0 {
             errorLabel?.stringValue = "닫힘·열림이 모두 끔입니다 · 하나를 고르세요"
@@ -621,7 +673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionACOnly = acOnlyCheck?.state == .on
         UserDefaults.standard.set(sessionACOnly, forKey: acOnlyKey)
 
-        guard closedSeconds > 0 else {
+        guard closedSeconds != 0 else {
             startOpen(openSeconds)
             updateButtons()
             updateStatusVisuals()
@@ -639,7 +691,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if result.0 {
                     self.closedRunning = true
                     self.leftoverSleepDisabled = false
-                    self.closedUntil = nowEpoch() + closedSeconds
+                    self.closedUnlimited = closedSeconds < 0
+                    self.closedUntil = closedSeconds > 0 ? nowEpoch() + closedSeconds : nil
                     self.startOpen(openSeconds)
                     self.beginActivity()
                 } else {
@@ -691,6 +744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.isStopping = false
                 self.closedRunning = false
                 self.closedUntil = nil
+                self.closedUnlimited = false
                 self.endActivity()
                 if stillDisabled {
                     self.leftoverSleepDisabled = true
@@ -710,8 +764,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let exe = Bundle.main.executablePath else { return (false, "앱 실행 파일 경로를 찾지 못했습니다") }
         unlink(stopPath)
         let gen = bumpGeneration()
-        let until = nowEpoch() + closedSeconds
-        writeText(untilPath, "\(until)\n")
+        // closedSeconds < 0 is 무한: no deadline, only 전원 연결·과열·배터리·해제 end it.
+        let unlimited = closedSeconds < 0
+        let until = unlimited ? 0 : nowEpoch() + closedSeconds
+        if unlimited {
+            unlink(untilPath)
+        } else {
+            writeText(untilPath, "\(until)\n")
+        }
 
         // pmset first: Clamshell Sleep is synchronous, so disablesleep must be on
         // before the watchdog's first poll. Roll back if the watchdog never starts.
@@ -719,7 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shellQuote(exe), "--watchdog", "--daemonize",
             "--gen", "\(gen)", "--closed-until", "\(until)", "--sleepnow-if-closed",
             "--gui-pid", "\(getpid())", "--pidfile", watchdogPidPath
-        ].joined(separator: " ") + (sessionACOnly ? " --ac-only" : "")
+        ].joined(separator: " ") + (sessionACOnly ? " --ac-only" : "") + (unlimited ? " --closed-unlimited" : "")
         // On battery with 전원 연결 중일 때만, start paused: the watchdog arms on AC.
         let armNow = !sessionACOnly || onACPower()
         let script = """
