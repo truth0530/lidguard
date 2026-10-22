@@ -29,6 +29,8 @@ run_wd() {
   LIDGUARD_GUI_GRACE="${GRACE:-60}" \
   LIDGUARD_FAKE_THERMAL="${FAKE_THERM:-nominal}" \
   LIDGUARD_FAKE_CLAMSHELL="${FAKE_CLAMSHELL:-No}" \
+  LIDGUARD_FAKE_POWER="${LIDGUARD_FAKE_POWER:-ac}" \
+  LIDGUARD_FAKE_POWER_FILE="${LIDGUARD_FAKE_POWER_FILE:-}" \
   "$BIN" --watchdog "$@"
 }
 
@@ -164,5 +166,42 @@ kill -0 "$WD" 2>/dev/null && fail "daemon ignored stop file"
 grep -q "revert: stop-file" "$log"
 [ -e "$pidfile" ] && fail "pidfile not removed"
 echo "ok daemonize + stop within poll"
+
+# 15) --ac-only on battery from the start: never arms, stays paused, reverts at deadline
+reset
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 2)" --ac-only
+grep -q "disablesleep 1" "$TMP/pmset.log" && fail "armed on battery with --ac-only"
+grep -q "power battery — pause" "$log"
+grep -q "phase=battery-paused" "$log"
+grep -q "revert: open-idle" "$log"
+echo "ok ac-only on battery stays paused"
+
+# 16) --ac-only: unplugging with the lid closed sends the Mac to sleep once
+reset
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 2)" --ac-only
+grep -q "battery with lid closed — sleepnow" "$log"
+[ "$(grep -c "pmset sleepnow" "$TMP/pmset.log")" -eq 1 ] || fail "sleepnow not exactly once"
+echo "ok ac-only unplug with lid closed sleeps"
+
+# 17) --ac-only: AC -> battery -> AC pauses and re-arms within the timer
+reset
+power="$TMP/power"; echo ac >"$power"
+LIDGUARD_FAKE_POWER_FILE="$power" FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 6)" --ac-only &
+WD=$!
+sleep 1.5; echo battery >"$power"
+sleep 2;   echo ac >"$power"
+wait $WD || true
+seq=$(grep -o "disablesleep [01]" "$TMP/pmset.log" | tr '\n' ',' )
+[ "$seq" = "disablesleep 1,disablesleep 0,disablesleep 1,disablesleep 0," ] || fail "unexpected pmset sequence: $seq"
+grep -q "power battery — pause" "$log"
+grep -q "power ac — resume" "$log"
+echo "ok ac-only pause and resume ($seq)"
+
+# 18) without --ac-only, battery changes nothing
+reset
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 2)"
+grep -q "pause" "$log" && fail "paused without --ac-only"
+grep -q "disablesleep 1" "$TMP/pmset.log"
+echo "ok battery ignored without ac-only"
 
 echo "ALL PASS"

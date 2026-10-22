@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import IOKit
+import IOKit.ps
 import IOKit.pwr_mgt
 
 // Native replacements for the old per-second `bash -lc` probes.
@@ -13,8 +14,10 @@ enum LidState: String {
 /// Test hooks are honoured only for non-root processes, so a root watchdog
 /// can never be redirected by its environment.
 func testOverride(_ key: String) -> String? {
-    guard getuid() != 0 else { return nil }
-    return ProcessInfo.processInfo.environment[key]
+    guard getuid() != 0, let value = ProcessInfo.processInfo.environment[key], !value.isEmpty else {
+        return nil
+    }
+    return value
 }
 
 private var rootDomainService: io_service_t = 0
@@ -69,6 +72,25 @@ func thermalLabel() -> String {
     case .critical: return "critical"
     @unknown default: return "unknown"
     }
+}
+
+/// True on the power adapter. Desktops always report AC. Unknown counts as AC.
+/// Test hook: LIDGUARD_FAKE_POWER=ac|battery, or LIDGUARD_FAKE_POWER_FILE whose
+/// content can change while a test runs.
+func onACPower() -> Bool {
+    if let path = testOverride("LIDGUARD_FAKE_POWER_FILE") {
+        let value = (try? String(contentsOfFile: path, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "ac"
+        return value != "battery"
+    }
+    if let fake = testOverride("LIDGUARD_FAKE_POWER") {
+        return fake != "battery"
+    }
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else {
+        return true
+    }
+    return (type as String) != "Battery Power"
 }
 
 /// EPERM means the process exists but belongs to another user (root watchdog).

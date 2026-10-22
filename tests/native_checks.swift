@@ -33,6 +33,10 @@ check("assertion released", gone && !assertion.isHeld)
 check("version compare", isVersion("1.6.0", newerThan: "1.5.0") && !isVersion("1.5.0", newerThan: "1.5")
       && isVersion("v1.10.0", newerThan: "1.9.9"))
 
+let ac = onACPower()
+let pmsetSource = runTool("/usr/bin/pmset", ["-g", "batt"]).output
+check("onACPower matches pmset -g batt", ac == pmsetSource.contains("AC Power"), "ac=\(ac)")
+
 // Per-call cost of the per-second probes (old code spawned bash for each).
 let n = 2000
 var t = Date()
@@ -41,6 +45,10 @@ let lidMicros = Date().timeIntervalSince(t) / Double(n) * 1_000_000
 t = Date()
 for _ in 0..<n { _ = pidAlive(1) }
 let pidMicros = Date().timeIntervalSince(t) / Double(n) * 1_000_000
+t = Date()
+for _ in 0..<200 { _ = onACPower() }
+let powerMicros = Date().timeIntervalSince(t) / 200 * 1_000_000
+print(String(format: "cost onACPower %.1f µs/call", powerMicros))
 print(String(format: "cost readLidState %.1f µs/call, pidAlive %.2f µs/call", lidMicros, pidMicros))
 check("native probes under 1 ms", lidMicros < 1000 && pidMicros < 1000)
 

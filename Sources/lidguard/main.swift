@@ -12,6 +12,7 @@ private let heartbeatPath = "\(stateDir)/lidguard_heartbeat"
 private let uiStatePath = "\(stateDir)/lidguard_ui"
 private let lastRevertPath = "\(stateDir)/lidguard_last_revert"
 private let lastUpdateCheckKey = "lastUpdateCheck"
+private let acOnlyKey = "acOnly"
 private let updateCheckInterval: TimeInterval = 24 * 60 * 60
 
 private let closedDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
@@ -87,6 +88,11 @@ private func readWatchdogClosedUntil() -> Int? {
     return nil
 }
 
+private func readWatchdogACOnly() -> Bool {
+    guard let raw = try? String(contentsOfFile: uiStatePath, encoding: .utf8) else { return false }
+    return raw.split(separator: "\n").contains("ac_only=1")
+}
+
 private let clockFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "ko_KR")
@@ -114,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var openRemain: NSTextField?
     var closedSeg: NSSegmentedControl?
     var openSeg: NSSegmentedControl?
+    var acOnlyCheck: NSButton?
     var startBtn: NSButton?
     var stopBtn: NSButton?
     var errorLabel: NSTextField?
@@ -122,6 +129,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var closedRunning = false
     /// Open-lid timer: an in-process IOPM assertion, no helper process.
     private let openAssertion = IdleSleepAssertion()
+    /// Open-lid timer is logically on; the assertion may be released while paused on battery.
+    private var openRunning = false
+    /// 전원 연결 중일 때만, fixed for the running session.
+    private var sessionACOnly = false
     private var isStarting = false
     private var isStopping = false
     private var closedUntil: Int?
@@ -140,7 +151,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var updateBusy = false
     private var updateChecking = false
 
-    private var isSessionActive: Bool { closedRunning || openAssertion.isHeld }
+    private var isSessionActive: Bool { closedRunning || openRunning }
+
+    /// Session is on but holding nothing because the Mac runs on battery.
+    private var pausedForBattery: Bool {
+        isSessionActive && sessionACOnly && !onACPower()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -166,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        openRunning = false
         openAssertion.release()
         if closedRunning || leftoverSleepDisabled || watchdogPidAlive() {
             stopClosedSession()
@@ -299,6 +316,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                seg: openSeg, accent: openAccent)
         self.openCard = openCard
 
+        let acOnly = NSButton(checkboxWithTitle: "전원 연결 중일 때만 · 배터리로 바뀌면 잠시 멈춥니다", target: nil, action: nil)
+        acOnly.font = NSFont.systemFont(ofSize: 12)
+        acOnly.state = UserDefaults.standard.bool(forKey: acOnlyKey) ? .on : .off
+        acOnly.translatesAutoresizingMaskIntoConstraints = false
+        self.acOnlyCheck = acOnly
+
         let rule = NSBox()
         rule.boxType = .separator
         rule.translatesAutoresizingMaskIntoConstraints = false
@@ -324,11 +347,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         errorLabel.isHidden = true
         self.errorLabel = errorLabel
 
-        let root = NSStackView(views: [closedCard, rule, openCard, buttons, errorLabel])
+        let root = NSStackView(views: [closedCard, rule, openCard, acOnly, buttons, errorLabel])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 16
-        root.setCustomSpacing(20, after: openCard)
+        root.setCustomSpacing(14, after: openCard)
+        root.setCustomSpacing(18, after: acOnly)
         root.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 18, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
         closedCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -44).isActive = true
@@ -369,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if watchdogAlive() {
             closedRunning = true
             closedUntil = readWatchdogClosedUntil()
+            sessionACOnly = readWatchdogACOnly()
             sessionStartedAt = nowEpoch()
             beginActivity()
         } else if pmsetSleepDisabled() {
@@ -382,8 +407,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Everything here is native (IOKit, kill(2), file reads): no process is spawned per second.
     func tick() {
         let now = nowEpoch()
-        if openAssertion.isHeld, !isStopping {
+        if openRunning, !isStopping {
             if thermalSerious() {
+                openRunning = false
                 openAssertion.release()
                 openUntil = nil
                 openUnlimited = false
@@ -392,11 +418,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     infoColor = .systemOrange
                 }
             } else if !openUnlimited, let until = openUntil, now >= until {
+                openRunning = false
                 openAssertion.release()
                 openUntil = nil
                 if !closedRunning {
                     infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(now))"
                     infoColor = .secondaryLabelColor
+                }
+            } else {
+                let allowed = !sessionACOnly || onACPower()
+                if allowed, !openAssertion.isHeld {
+                    openAssertion.hold(reason: "잠자기 방지: 뚜껑이 열렸을 때만 켜 두기")
+                } else if !allowed, openAssertion.isHeld {
+                    openAssertion.release()
                 }
             }
         }
@@ -404,6 +438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             closedRunning = false
             let revert = readLastRevert().flatMap { $0.epoch >= sessionStartedAt ? $0 : nil }
             if let revert, revert.reason.hasPrefix("thermal") {
+                openRunning = false
                 openAssertion.release()
                 openUntil = nil
                 openUnlimited = false
@@ -414,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else if revert != nil || (closedUntil.map { now >= $0 } ?? true) {
                 closedUntil = nil
                 lastError = nil
-                if !openAssertion.isHeld {
+                if !openRunning {
                     infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(revert?.epoch ?? now))"
                     infoColor = .secondaryLabelColor
                 }
@@ -445,6 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopBtn?.isEnabled = (isSessionActive || leftoverSleepDisabled) && !busy
         closedSeg?.isEnabled = !isSessionActive && !busy
         openSeg?.isEnabled = !isSessionActive && !busy
+        acOnlyCheck?.isEnabled = !isSessionActive && !busy
     }
 
     func closedArmed() -> Bool {
@@ -453,7 +489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func openArmed() -> Bool {
-        guard openAssertion.isHeld else { return false }
+        guard openRunning else { return false }
         if openUnlimited { return true }
         guard let until = openUntil else { return false }
         return until > nowEpoch()
@@ -462,8 +498,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func paintModeCards() {
         let session = isSessionActive || isStarting || isStopping
         let lidIsClosed = lidClosed()
-        let closedLive = session && closedArmed()
-        let openLive = session && !lidIsClosed && openArmed()
+        let paused = pausedForBattery
+        let closedLive = session && closedArmed() && !paused
+        let openLive = session && !lidIsClosed && openArmed() && !paused
         let closedRemainText = closedUntil.map { fmtDuration($0 - nowEpoch()) } ?? ""
         let openRemainText: String = {
             if openUnlimited { return "무한" }
@@ -537,6 +574,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             errorLabel?.stringValue = lastError
             errorLabel?.textColor = .systemRed
             errorLabel?.isHidden = false
+        } else if pausedForBattery {
+            errorLabel?.stringValue = "배터리 사용 중이라 잠시 멈췄습니다 · 전원을 연결하면 남은 시간 동안 다시 켜집니다"
+            errorLabel?.textColor = .systemOrange
+            errorLabel?.isHidden = false
         } else if let infoMessage {
             errorLabel?.stringValue = infoMessage
             errorLabel?.textColor = infoColor
@@ -545,7 +586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             errorLabel?.stringValue = ""
             errorLabel?.isHidden = true
         }
-        let key = "\(isSessionActive)-\(isStarting)-\(isStopping)-\(lidClosed())-\(closedArmed())-\(openArmed())-\(errorLabel?.isHidden == true)-\(errorLabel?.stringValue.count ?? 0 > 40)"
+        let key = "\(pausedForBattery)-\(isSessionActive)-\(isStarting)-\(isStopping)-\(lidClosed())-\(closedArmed())-\(openArmed())-\(errorLabel?.isHidden == true)-\(errorLabel?.stringValue.count ?? 0 > 40)"
         if key != lastLayoutKey {
             lastLayoutKey = key
             sizeWindow(animate: true)
@@ -567,6 +608,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastError = nil
         infoMessage = nil
         sessionStartedAt = nowEpoch()
+        sessionACOnly = acOnlyCheck?.state == .on
+        UserDefaults.standard.set(sessionACOnly, forKey: acOnlyKey)
 
         guard closedSeconds > 0 else {
             startOpen(openSeconds)
@@ -604,10 +647,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openUnlimited = false
             return
         }
-        guard openAssertion.hold(reason: "잠자기 방지: 뚜껑이 열렸을 때만 켜 두기") else {
-            lastError = "잠자기 방지 요청을 만들지 못했습니다"
-            return
+        if !sessionACOnly || onACPower() {
+            guard openAssertion.hold(reason: "잠자기 방지: 뚜껑이 열렸을 때만 켜 두기") else {
+                lastError = "잠자기 방지 요청을 만들지 못했습니다"
+                return
+            }
         }
+        openRunning = true
         openUnlimited = openSeconds < 0
         openUntil = openSeconds > 0 ? nowEpoch() + openSeconds : nil
         beginActivity()
@@ -617,6 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isStopping else { return }
         isStopping = true
         lastError = nil
+        openRunning = false
         openAssertion.release()
         openUntil = nil
         openUnlimited = false
@@ -662,11 +709,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shellQuote(exe), "--watchdog", "--daemonize",
             "--gen", "\(gen)", "--closed-until", "\(until)", "--sleepnow-if-closed",
             "--gui-pid", "\(getpid())", "--pidfile", watchdogPidPath
-        ].joined(separator: " ")
+        ].joined(separator: " ") + (sessionACOnly ? " --ac-only" : "")
+        // On battery with 전원 연결 중일 때만, start paused: the watchdog arms on AC.
+        let armNow = !sessionACOnly || onACPower()
         let script = """
         #!/bin/bash
         /bin/rm -f \(watchdogPidPath)
-        /usr/bin/pmset -a disablesleep 1 || exit 1
+        \(armNow ? "/usr/bin/pmset -a disablesleep 1 || exit 1" : ": paused on battery")
         \(launch) >>\(watchdogLogPath) 2>&1
         for i in $(/usr/bin/seq 1 30); do
           PID=$(/usr/bin/tr -d '[:space:]' < \(watchdogPidPath) 2>/dev/null)

@@ -8,6 +8,7 @@
 - **뚜껑이 열렸을 때만 켜 두기**: 앱 안에서 `PreventUserIdleSystemSleep` 요청(`caffeinate -i`와 같은 효과)을 잡습니다. 별도 프로그램이나 관리자 암호가 필요 없고, 앱이 꺼지면 macOS가 즉시 풀어 줍니다. 뚜껑을 닫으면 평소처럼 잠들고, 다시 열면 남은 시간 동안 이어집니다. **끔**이면 화면·시스템 잠자기를 막지 않습니다.
 - 닫힘 유지가 켜져 있는 동안은 화면 자동꺼짐도 막힙니다. 창을 닫거나 종료하면 워치독이 `disablesleep`을 되돌립니다.
 - 앱을 강제 종료하거나 앱이 죽어도, 워치독이 앱이 사라진 것을 보고 약 1분 안에 잠자기를 되돌립니다.
+- **전원 연결 중일 때만** (선택): 배터리로 바뀌면 잠시 멈추고 잠자기를 macOS에 돌려줍니다. 뚜껑이 닫힌 채 어댑터를 뽑으면 바로 잠듭니다. 남은 시간 안에 다시 꽂으면 이어서 켜집니다. 두 모드 모두에 적용됩니다.
 - macOS 과열 상태가 `serious` 이상이면 남은 시간과 관계없이 바로 해제합니다.
 - 해제되면 창에 이유와 시각이 남습니다: 직접 해제, 시간 종료, 과열.
 
@@ -53,13 +54,14 @@
 - 열림 모드는 `caffeinate`와 감시 프로세스 대신 앱 안 IOPM 요청 하나로 끝난다.
 - 감시 스크립트(bash)와 `daemonize.py`(python)를 없애고, 같은 실행 파일의 Swift 감시 모드로 옮겼다. `POSIX_SPAWN_SETSID`로 관리자 셸과 수명을 끊는다. `pmset`은 켤 때 한 번, 끌 때 한 번만 실행하고, 과열은 `ProcessInfo.thermalState`로 판단한다. 2초 간격이라 해제가 빨라졌고, SIGTERM을 받아도 잠자기를 되돌린다. 같은 조건(10초, 1초 간격)에서 CPU 시간 0.47초→0.04초, `pmset` 실행 22회→2회.
 - 강제 종료 감지는 앱 이름(`pgrep`) 대신 앱 PID로 한다.
+- `전원 연결 중일 때만` 옵션: 감시 모드 `--ac-only`, 전원 상태는 `IOPSGetProvidingPowerSourceType`(약 80µs)로 읽는다.
 - 업데이트 확인은 임시(ephemeral) 네트워크 세션을 쓰고 끝나면 닫는다. 빌드는 `-dead_strip`과 `strip -x`.
 
 ## 개발
 
 ```bash
 bash scripts/build.sh
-bash tests/test_watchdog.sh   # 가짜 pmset·뚜껑·과열로 감시 모드 14가지 시나리오
+bash tests/test_watchdog.sh   # 가짜 pmset·뚜껑·과열·전원으로 감시 모드 18가지 시나리오
 bash tests/test_native.sh     # 실제 Mac에서 IOKit·kill·IOPM 요청·호출 비용 확인
 bash scripts/release.sh [노트파일]   # Info.plist 버전으로 v태그 릴리스, zip + sha256 업로드
 ```

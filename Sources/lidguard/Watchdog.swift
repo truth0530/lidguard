@@ -3,7 +3,7 @@ import Foundation
 
 // Closed-lid watchdog. Runs as root from the same binary:
 //   lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed]
-//            [--gui-pid PID] [--pidfile PATH] [--daemonize]
+//            [--gui-pid PID] [--pidfile PATH] [--ac-only] [--daemonize]
 // It owns `pmset disablesleep` for the closed-lid timer and must keep working
 // if the GUI dies. Each poll is a file stat plus an IOKit read; pmset runs only
 // on transitions (set once, clear once, optional sleepnow).
@@ -16,6 +16,7 @@ struct WatchdogOptions {
     var sleepnowIfClosed = false
     var guiPid: pid_t?
     var pidfile: String?
+    var acOnly = false
     var daemonize = false
 }
 
@@ -53,6 +54,7 @@ enum Watchdog {
             case "--sleepnow-if-closed": options.sleepnowIfClosed = true
             case "--gui-pid": options.guiPid = Int32(value() ?? "")
             case "--pidfile": options.pidfile = value()
+            case "--ac-only": options.acOnly = true
             case "--daemonize": options.daemonize = true
             default:
                 FileHandle.standardError.write("unknown arg: \(args[i])\n".data(using: .utf8)!)
@@ -67,7 +69,7 @@ enum Watchdog {
     static func main(_ rawArgs: [String]) -> Int32 {
         guard let options = parse(rawArgs) else {
             FileHandle.standardError.write(
-                "usage: lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed] [--gui-pid PID] [--pidfile PATH] [--daemonize]\n"
+                "usage: lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed] [--gui-pid PID] [--pidfile PATH] [--ac-only] [--daemonize]\n"
                     .data(using: .utf8)!)
             return 2
         }
@@ -121,6 +123,7 @@ struct WatchdogLoop {
     var lastPhase = ""
     var guiMissingSince: Int?
     var lidUnknownLogged = false
+    var pausedForBattery = false
 
     init(options: WatchdogOptions) {
         self.options = options
@@ -200,6 +203,7 @@ struct WatchdogLoop {
         writeText(Watchdog.uiStatePath, """
         heartbeat=\(now)
         closed_until=\(options.closedUntil)
+        ac_only=\(options.acOnly ? 1 : 0)
         lid=\(lid.rawValue)
         phase=\(phase)
         gen=\(options.gen)
@@ -212,8 +216,8 @@ struct WatchdogLoop {
     }
 
     mutating func run() -> Int32 {
-        log("start gen=\(options.gen) closed_until=\(options.closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") poll=\(Watchdog.pollSeconds)")
-        if closedActive(nowEpoch()) {
+        log("start gen=\(options.gen) closed_until=\(options.closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") ac_only=\(options.acOnly) poll=\(Watchdog.pollSeconds)")
+        if closedActive(nowEpoch()), !options.acOnly || onACPower() {
             setDisableSleep()
         }
         while true {
@@ -266,6 +270,28 @@ struct WatchdogLoop {
                 case .unknown: revert("lid-state-unknown")
                 }
                 return 0
+            }
+            // 전원 연결 중일 때만: on battery, give sleep back to macOS but keep
+            // the timer; plugging in again within the timer re-arms.
+            if options.acOnly, !onACPower() {
+                if !pausedForBattery {
+                    pausedForBattery = true
+                    log("power battery — pause")
+                    // Always clear: the start script may have set it before this process tracked it.
+                    clearDisableSleep()
+                    if lid == .closed {
+                        log("battery with lid closed — sleepnow")
+                        runTool(Watchdog.pmsetPath, ["sleepnow"])
+                    }
+                }
+                heartbeat(now, lid: lid == .unknown ? lastLid : lid, phase: "battery-paused")
+                let wait = max(0, min(Watchdog.pollSeconds, options.closedUntil - now))
+                if wait > 0 { sleep(UInt32(wait)) } else if Watchdog.pollSeconds == 0 { usleep(50_000) }
+                continue
+            }
+            if pausedForBattery {
+                pausedForBattery = false
+                log("power ac — resume")
             }
             // Closed mode must hold disablesleep even while the lid is still
             // open; Clamshell Sleep is synchronous, so a post-close poll loses.
