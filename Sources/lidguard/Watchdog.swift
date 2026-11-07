@@ -6,6 +6,8 @@ import Foundation
 //            [--gui-pid PID] [--pidfile PATH] [--ac-only [--closed-unlimited]] [--daemonize]
 // --closed-unlimited has no deadline and is accepted only with --ac-only, so
 // unplugging, overheating, 5% battery, the app exiting or 해제 always end it.
+// A finite closed timer keeps disablesleep on battery too. That is what holds
+// a personal hotspot across a lid close. Only 무한 yields when unplugged.
 // It owns `pmset disablesleep` for the closed-lid timer and must keep working
 // if the GUI dies. Each poll is a file stat plus an IOKit read; pmset runs only
 // on transitions (set once, clear once, optional sleepnow).
@@ -162,6 +164,12 @@ struct WatchdogLoop {
         options.closedUnlimited || (options.closedUntil > 0 && now < options.closedUntil)
     }
 
+    /// Timed closed-lid stays awake on battery so Wi-Fi survives the lid closing.
+    /// Unlimited mode still stops on battery.
+    func holdsClosedSleep(onAC: Bool) -> Bool {
+        options.closedUnlimited ? onAC : true
+    }
+
     /// Seconds to sleep: one poll, or less so the deadline is hit exactly.
     func pollWait(_ now: Int) -> Int {
         options.closedUnlimited
@@ -242,7 +250,7 @@ struct WatchdogLoop {
 
     mutating func run() -> Int32 {
         log("start gen=\(options.gen) closed_until=\(options.closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") ac_only=\(options.acOnly) unlimited=\(options.closedUnlimited) poll=\(Watchdog.pollSeconds)")
-        if closedActive(nowEpoch()), !options.acOnly || onACPower() {
+        if closedActive(nowEpoch()), holdsClosedSleep(onAC: onACPower()) {
             setDisableSleep()
         }
         while true {
@@ -302,9 +310,9 @@ struct WatchdogLoop {
                 }
                 return 0
             }
-            // 전원 연결 중일 때만: on battery, give sleep back to macOS but keep
-            // the timer; plugging in again within the timer re-arms.
-            if options.acOnly, !onACPower() {
+            // 무한만 배터리에서 잠자기를 돌려준다. 시간을 정한 닫힘 유지는
+            // 배터리에서도 disablesleep을 유지해 핫스팟이 뚜껑을 닫아도 남는다.
+            if options.closedUnlimited, !onACPower() {
                 if !pausedForBattery {
                     pausedForBattery = true
                     log("power battery — pause")

@@ -189,9 +189,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var isSessionActive: Bool { closedRunning || openRunning }
 
-    /// Session is on but holding nothing because the Mac runs on battery.
+    /// Unlimited closed mode, or an open-only session, is waiting for power.
+    /// A timed closed-lid session stays armed on battery so the hotspot survives.
     private var pausedForBattery: Bool {
-        isSessionActive && sessionACOnly && !onACPower()
+        guard isSessionActive, sessionACOnly, !onACPower() else { return false }
+        if closedRunning, !closedUnlimited { return false }
+        return true
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -374,7 +377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         acOnly.controlSize = .small
         acOnly.font = NSFont.systemFont(ofSize: 11)
         acOnly.state = startsACOnly ? .on : .off
-        acOnly.toolTip = "배터리로 바뀌면 멈춥니다. 켜면 6시간 대신 무한을 고를 수 있습니다."
+        acOnly.toolTip = "시간을 정한 닫힘 유지는 배터리에서도 유지됩니다. 무한만 전원이 빠지면 멈춥니다. 켜면 6시간 대신 무한을 고를 수 있습니다."
         acOnly.setContentHuggingPriority(.required, for: .horizontal)
         acOnly.setContentCompressionResistancePriority(.required, for: .horizontal)
         self.acOnlyCheck = acOnly
@@ -633,9 +636,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func paintModeCards() {
         let session = isSessionActive || isStarting || isStopping
         let lidIsClosed = lidClosed()
-        let paused = pausedForBattery
-        let closedLive = session && closedArmed() && !paused
-        let openLive = session && !lidIsClosed && openArmed() && !paused
+        let closedPaused = session && closedUnlimited && sessionACOnly && !onACPower()
+        let openPaused = session && sessionACOnly && !onACPower()
+        let closedLive = session && closedArmed() && !closedPaused
+        let openLive = session && !lidIsClosed && openArmed() && !openPaused
         let closedRemainText = closedUnlimited ? "무한" : (closedUntil.map { fmtDuration($0 - nowEpoch()) } ?? "")
         let openRemainText: String = {
             if openUnlimited { return "무한" }
@@ -856,8 +860,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "--gen", "\(gen)", "--closed-until", "\(until)", "--sleepnow-if-closed",
             "--gui-pid", "\(getpid())", "--pidfile", watchdogPidPath
         ].joined(separator: " ") + (sessionACOnly ? " --ac-only" : "") + (unlimited ? " --closed-unlimited" : "")
-        // On battery with 전원 연결 중일 때만, start paused: the watchdog arms on AC.
-        let armNow = !sessionACOnly || onACPower()
+        // Arm before the first poll. A timed close stays armed on battery so the
+        // hotspot is not dropped by clamshell sleep. 무한 waits for AC power.
+        let armNow = !unlimited || onACPower()
         let script = """
         #!/bin/bash
         /bin/rm -f \(watchdogPidPath)

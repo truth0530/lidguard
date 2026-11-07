@@ -175,35 +175,44 @@ grep -q "revert: stop-file" "$log"
 [ -e "$pidfile" ] && fail "pidfile not removed"
 echo "ok daemonize + stop within poll"
 
-# 15) --ac-only on battery from the start: never arms, stays paused, reverts at deadline
+# 15) timed close + --ac-only on battery: stay armed so a hotspot survives the lid
 reset
-LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 3)" --ac-only
-grep -q "disablesleep 1" "$TMP/pmset.log" && fail "armed on battery with --ac-only"
-grep -q "power battery — pause" "$log"
-grep -q "phase=battery-paused" "$log"
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 2)" --ac-only
+grep -q "disablesleep 1" "$TMP/pmset.log" || fail "timed close did not arm on battery"
+grep -q "power battery — pause" "$log" && fail "timed close paused on battery"
+grep -q "phase=lid-open-closed-armed" "$log"
 grep -q "revert: open-idle" "$log"
-echo "ok ac-only on battery stays paused"
+grep -q "sleepnow" "$TMP/pmset.log" && fail "sleepnow while lid open"
+echo "ok timed close stays armed on battery"
 
-# 16) --ac-only: unplugging with the lid closed sends the Mac to sleep once
+# 16) timed close on battery with the lid already closed: no immediate sleep, sleep at the deadline
 reset
-LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 3)" --ac-only
-grep -q "battery with lid closed — sleepnow" "$log"
-[ "$(grep -c "pmset sleepnow" "$TMP/pmset.log")" -eq 1 ] || fail "sleepnow not exactly once"
-echo "ok ac-only unplug with lid closed sleeps"
+LIDGUARD_FAKE_POWER=battery FAKE_CLAMSHELL=Yes run_wd --gen 1 --closed-until "$(soon 2)" --ac-only --sleepnow-if-closed
+grep -q "disablesleep 1" "$TMP/pmset.log" || fail "did not hold disablesleep"
+grep -q "phase=lid-closed-awake" "$log" || fail "never stayed awake with the lid closed"
+grep -q "battery with lid closed — sleepnow" "$log" && fail "slept immediately on battery"
+grep -q "revert: closed-idle" "$log"
+grep -q "clamshell closed — sleepnow" "$log"
+[ "$(grep -c "pmset sleepnow" "$TMP/pmset.log")" -eq 1 ] || fail "sleepnow not exactly once at the deadline"
+echo "ok timed close keeps hotspot until the deadline"
 
-# 17) --ac-only: AC -> battery -> AC pauses and re-arms within the timer
+# 17) 무한 still pauses on battery and re-arms when power returns
 reset
 power="$TMP/power"; echo ac >"$power"
-LIDGUARD_FAKE_POWER_FILE="$power" FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 6)" --ac-only &
+LIDGUARD_FAKE_POWER_FILE="$power" FAKE_CLAMSHELL=No \
+  run_wd --gen 1 --closed-until 0 --closed-unlimited --ac-only &
 WD=$!
 sleep 1.5; echo battery >"$power"
 sleep 2;   echo ac >"$power"
+sleep 1.5
+touch "$TMP/lidguard_stop"
 wait $WD || true
 seq=$(grep -o "disablesleep [01]" "$TMP/pmset.log" | tr '\n' ',' )
 [ "$seq" = "disablesleep 1,disablesleep 0,disablesleep 1,disablesleep 0," ] || fail "unexpected pmset sequence: $seq"
 grep -q "power battery — pause" "$log"
 grep -q "power ac — resume" "$log"
-echo "ok ac-only pause and resume ($seq)"
+grep -q "sleepnow" "$TMP/pmset.log" && fail "sleepnow while lid open"
+echo "ok unlimited pauses and resumes ($seq)"
 
 # 18) without --ac-only, battery changes nothing
 reset
