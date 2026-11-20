@@ -1,16 +1,23 @@
 import AppKit
 import Foundation
 
-private let stateDir = "/tmp"
-private let genPath = "\(stateDir)/lidguard_gen"
-private let untilPath = "\(stateDir)/lidguard_until"
-private let stopPath = "\(stateDir)/lidguard_stop"
+/// Root-owned watchdog state (/var/run/lidguard). The GUI only reads it.
+private let stateDir = Watchdog.stateDir
 private let watchdogPidPath = "\(stateDir)/lidguard_watchdog.pid"
 private let watchdogLogPath = "\(stateDir)/lidguard_watchdog.log"
-private let startScriptPath = "\(stateDir)/lidguard_start.sh"
 private let heartbeatPath = "\(stateDir)/lidguard_heartbeat"
 private let uiStatePath = "\(stateDir)/lidguard_ui"
 private let lastRevertPath = "\(stateDir)/lidguard_last_revert"
+/// User-owned requests (stop, new deadline) and the open-lid state, mode 700.
+/// Other tools (for example a voice assistant) write requests here.
+private let requestDir: String = testOverride("LIDGUARD_REQUEST_DIR")
+    ?? (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/lidguard")
+private let stopPath = "\(requestDir)/\(RequestFiles.stop)"
+private let openRequestPath = "\(requestDir)/\(RequestFiles.openUntil)"
+private let openStatePath = "\(requestDir)/\(RequestFiles.openState)"
+/// 1.5.5 and older kept everything in /tmp. Used only to stop such a session.
+private let legacyPidPath = "/tmp/lidguard_watchdog.pid"
+private let legacyStopPath = "/tmp/lidguard_stop"
 private let lastUpdateCheckKey = "lastUpdateCheck"
 private let acOnlyKey = "acOnly"
 private let updateCheckInterval: TimeInterval = 24 * 60 * 60
@@ -25,14 +32,6 @@ private let closedLongSeconds = 6 * 60 * 60
 private let openDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, -1]
 private let openLabels = ["끔", "15분", "30분", "1시간", "2시간", "4시간", "무한"]
 
-private func shellQuote(_ value: String) -> String {
-    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-}
-
-private func appleQuote(_ value: String) -> String {
-    "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-}
 
 @discardableResult
 private func adminShell(_ command: String) -> (Bool, String) {
@@ -67,14 +66,17 @@ private func fmtDuration(_ seconds: Int) -> String {
     return String(format: "%d초", sec)
 }
 
-private func bumpGeneration() -> Int {
-    let current = Int((try? String(contentsOfFile: genPath, encoding: .utf8))?
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
-    let next = current + 1
-    writeText(genPath, "\(next)\n")
-    chmod(genPath, 0o666)
-    return next
+private func ensureRequestDir() {
+    try? FileManager.default.createDirectory(atPath: requestDir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    chmod(requestDir, 0o700)
 }
+
+private func legacyWatchdogAlive() -> Bool {
+    guard let pid = readPidFile(legacyPidPath) else { return false }
+    return pidAlive(pid)
+}
+
 
 /// Watchdog writes `<epoch> <reason>` whenever it restores sleep.
 private func readLastRevert() -> (epoch: Int, reason: String)? {
@@ -520,6 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             leftoverSleepDisabled = true
             lastError = "이전 잠자기 방지 설정이 남아 있습니다 · 해제를 눌러 되돌리세요"
         }
+        writeOpenState()
         updateButtons()
         updateStatusVisuals()
     }
@@ -527,6 +530,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Everything here is native (IOKit, kill(2), file reads): no process is spawned per second.
     func tick() {
         let now = nowEpoch()
+        // 해제 requested from outside the window (same effect as the button).
+        if isSessionActive, !isStopping, !isStarting, access(stopPath, F_OK) == 0 {
+            stopPressed()
+            return
+        }
+        if openRunning, !isStopping, !openUnlimited, let until = openUntil,
+           let raw = readUserRequest(openRequestPath, uid: getuid(), dir: requestDir) {
+            unlink(openRequestPath)
+            if let requested = Int(raw), requested > 0 {
+                let clamped = min(max(requested, now + Watchdog.minRequestSeconds), now + Watchdog.maxRequestSeconds)
+                if clamped != until {
+                    openUntil = clamped
+                    writeOpenState()
+                }
+            }
+        }
+        // The watchdog may move the deadline on request; follow it.
+        if closedRunning, !isStopping, !closedUnlimited, let current = readWatchdogClosedUntil(), current != closedUntil {
+            closedUntil = current
+        }
         if openRunning, !isStopping {
             let safetyReason: String? = thermalSerious() ? "thermal" : (batteryLow() ? "battery-low" : nil)
             if let safetyReason {
@@ -534,6 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 openAssertion.release()
                 openUntil = nil
                 openUnlimited = false
+                writeOpenState()
                 if !closedRunning {
                     let (message, color) = revertMessage(safetyReason, at: now)
                     infoMessage = message
@@ -543,6 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 openRunning = false
                 openAssertion.release()
                 openUntil = nil
+                writeOpenState()
                 if !closedRunning {
                     infoMessage = "해제됨 · 시간이 끝나 잠자기로 돌아갔습니다 · \(clockText(now))"
                     infoColor = .secondaryLabelColor
@@ -561,12 +586,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let revert = readLastRevert().flatMap { $0.epoch >= sessionStartedAt ? $0 : nil }
             let wasUnlimited = closedUnlimited
             closedUnlimited = false
-            if let revert, revert.reason.hasPrefix("thermal") || revert.reason.hasPrefix("battery-low") {
-                // Safety reverts end the whole session, open-lid timer included.
+            if let revert, revert.reason.hasPrefix("thermal") || revert.reason.hasPrefix("battery-low")
+                || revert.reason == "stop-file" {
+                // Safety reverts and 해제 end the whole session, open-lid timer included.
                 openRunning = false
                 openAssertion.release()
                 openUntil = nil
                 openUnlimited = false
+                writeOpenState()
+                unlink(stopPath)
                 closedUntil = nil
                 lastError = nil
                 let (message, color) = revertMessage(revert.reason, at: revert.epoch)
@@ -749,6 +777,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         lastError = nil
         infoMessage = nil
+        // A stale 해제 request must not end the session being started.
+        unlink(stopPath)
         sessionStartedAt = nowEpoch()
         sessionACOnly = acOnlyCheck?.state == .on
         UserDefaults.standard.set(sessionACOnly, forKey: acOnlyKey)
@@ -799,7 +829,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openRunning = true
         openUnlimited = openSeconds < 0
         openUntil = openSeconds > 0 ? nowEpoch() + openSeconds : nil
+        unlink(openRequestPath)
+        writeOpenState()
         beginActivity()
+    }
+
+    /// Open-lid timer state for other tools. Written on change only.
+    func writeOpenState() {
+        ensureRequestDir()
+        let text = """
+        gui_pid=\(getpid())
+        updated=\(nowEpoch())
+        open_running=\(openRunning ? 1 : 0)
+        open_until=\(openUntil ?? 0)
+        open_unlimited=\(openUnlimited ? 1 : 0)
+        ac_only=\(sessionACOnly ? 1 : 0)
+
+        """
+        writeText(openStatePath, text)
+        chmod(openStatePath, 0o600)
     }
 
     @objc func stopPressed() {
@@ -810,7 +858,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openAssertion.release()
         openUntil = nil
         openUnlimited = false
-        let needsClosedStop = closedRunning || leftoverSleepDisabled || watchdogPidAlive()
+        writeOpenState()
+        let needsClosedStop = closedRunning || leftoverSleepDisabled || watchdogPidAlive() || legacyWatchdogAlive()
         updateButtons()
         updateStatusVisuals()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -826,6 +875,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.closedUntil = nil
                 self.closedUnlimited = false
                 self.endActivity()
+                unlink(stopPath)
                 if stillDisabled {
                     self.leftoverSleepDisabled = true
                     self.lastError = "아직 잠자기 방지가 남아 있습니다 · 해제를 다시 눌러 주세요"
@@ -842,46 +892,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startClosedSession(closedSeconds: Int) -> (Bool, String) {
         guard let exe = Bundle.main.executablePath else { return (false, "앱 실행 파일 경로를 찾지 못했습니다") }
+        ensureRequestDir()
         unlink(stopPath)
-        let gen = bumpGeneration()
+        unlink("\(requestDir)/\(RequestFiles.closedUntil)")
         // closedSeconds < 0 is 무한: no deadline, only 전원 연결·과열·배터리·해제 end it.
         let unlimited = closedSeconds < 0
         let until = unlimited ? 0 : nowEpoch() + closedSeconds
-        if unlimited {
-            unlink(untilPath)
-        } else {
-            writeText(untilPath, "\(until)\n")
-        }
-
         // pmset first: Clamshell Sleep is synchronous, so disablesleep must be on
         // before the watchdog's first poll. Roll back if the watchdog never starts.
-        let launch = [
-            shellQuote(exe), "--watchdog", "--daemonize",
-            "--gen", "\(gen)", "--closed-until", "\(until)", "--sleepnow-if-closed",
-            "--gui-pid", "\(getpid())", "--pidfile", watchdogPidPath
-        ].joined(separator: " ") + (sessionACOnly ? " --ac-only" : "") + (unlimited ? " --closed-unlimited" : "")
-        // Arm before the first poll. A timed close stays armed on battery so the
-        // hotspot is not dropped by clamshell sleep. 무한 waits for AC power.
-        let armNow = !unlimited || onACPower()
-        let script = """
-        #!/bin/bash
-        /bin/rm -f \(watchdogPidPath)
-        \(armNow ? "/usr/bin/pmset -a disablesleep 1 || exit 1" : ": paused on battery")
-        \(launch) >>\(watchdogLogPath) 2>&1
-        for i in $(/usr/bin/seq 1 30); do
-          PID=$(/usr/bin/tr -d '[:space:]' < \(watchdogPidPath) 2>/dev/null)
-          if [ -n "$PID" ] && /bin/kill -0 "$PID" 2>/dev/null; then
-            exit 0
-          fi
-          /bin/sleep 0.1
-        done
-        /usr/bin/pmset -a disablesleep 0
-        echo "워치독이 시작되지 않았습니다"
-        exit 1
-        """
-        writeText(startScriptPath, script)
-        chmod(startScriptPath, 0o755)
-        let (ok, out) = adminShell("/bin/bash \(startScriptPath)")
+        // A timed close stays armed on battery so the hotspot is not dropped by
+        // clamshell sleep. 무한 waits for AC power.
+        let script = buildStartScript(
+            exe: exe, closedUntil: until, guiPid: getpid(), acOnly: sessionACOnly,
+            unlimited: unlimited, armNow: !unlimited || onACPower(),
+            requestDir: requestDir, requestUid: getuid())
+        let (ok, out) = adminShell("/bin/bash -c \(shellQuote(script))")
         if !ok {
             let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.localizedCaseInsensitiveContains("User canceled") || trimmed.contains("-128") {
@@ -894,19 +919,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The watchdog polls every 2 s, so the stop file normally lands within that window.
     private func stopClosedSession() {
+        ensureRequestDir()
         writeText(stopPath, "1\n")
+        let legacy = legacyWatchdogAlive()
+        if legacy { writeText(legacyStopPath, "1\n") }
         for _ in 0..<40 {
-            if !watchdogPidAlive() { break }
+            if !watchdogPidAlive(), !legacyWatchdogAlive() { break }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        if watchdogPidAlive() {
-            _ = bumpGeneration()
+        // Still alive: end it as root. A stale watchdog must never be left
+        // holding disablesleep, so this replaces the old generation bump.
+        let stuck = [readPidFile(watchdogPidPath), readPidFile(legacyPidPath)]
+            .compactMap { $0 }.filter { pidAlive($0) }
+        if !stuck.isEmpty || pmsetSleepDisabled() {
+            let kills = stuck.map { "/bin/kill \($0) 2>/dev/null;" }.joined(separator: " ")
+            _ = adminShell("\(kills) /usr/bin/pmset -a disablesleep 0; exit 0")
         }
-        if pmsetSleepDisabled() {
-            _ = adminShell("/usr/bin/pmset -a disablesleep 0; exit 0")
-        }
-        unlink(untilPath)
         unlink(stopPath)
+        if legacy { unlink(legacyStopPath) }
     }
 
     // MARK: - Update

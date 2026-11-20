@@ -4,6 +4,10 @@ import Foundation
 // Closed-lid watchdog. Runs as root from the same binary:
 //   lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed]
 //            [--gui-pid PID] [--pidfile PATH] [--ac-only [--closed-unlimited]] [--daemonize]
+//            [--request-dir DIR --request-uid UID]
+// State it writes (pid, ui, heartbeat, gen, last_revert, log) lives in a
+// root-owned dir (/var/run/lidguard). Requests from the user (stop, new
+// deadline) come from the user's own dir, read with O_NOFOLLOW and an owner check.
 // --closed-unlimited has no deadline and is accepted only with --ac-only, so
 // unplugging, overheating, 5% battery, the app exiting or 해제 always end it.
 // A finite closed timer keeps disablesleep on battery too. That is what holds
@@ -23,13 +27,19 @@ struct WatchdogOptions {
     var acOnly = false
     var closedUnlimited = false
     var daemonize = false
+    var requestDir: String?
+    var requestUid: uid_t?
 }
 
 enum Watchdog {
-    static let stateDir = ProcessInfo.processInfo.environment["LIDGUARD_STATE_DIR"] ?? "/tmp"
+    /// Root-owned. Only the admin start script and this process write here.
+    static let defaultStateDir = "/var/run/lidguard"
+    static let stateDir = testOverride("LIDGUARD_STATE_DIR") ?? defaultStateDir
+    /// Hard cap for a deadline set by request: 6 hours from now.
+    static let maxRequestSeconds = 6 * 60 * 60
+    /// Shortest deadline a request can set, so a typo cannot end the session at once.
+    static var minRequestSeconds: Int { Int(testOverride("LIDGUARD_MIN_REQUEST_SECONDS") ?? "") ?? 60 }
     static var genPath: String { "\(stateDir)/lidguard_gen" }
-    static var stopPath: String { "\(stateDir)/lidguard_stop" }
-    static var untilPath: String { "\(stateDir)/lidguard_until" }
     static var heartbeatPath: String { "\(stateDir)/lidguard_heartbeat" }
     static var uiStatePath: String { "\(stateDir)/lidguard_ui" }
     static var lastRevertPath: String { "\(stateDir)/lidguard_last_revert" }
@@ -62,6 +72,8 @@ enum Watchdog {
             case "--ac-only": options.acOnly = true
             case "--closed-unlimited": options.closedUnlimited = true
             case "--daemonize": options.daemonize = true
+            case "--request-dir": options.requestDir = value()
+            case "--request-uid": options.requestUid = UInt32(value() ?? "")
             default:
                 FileHandle.standardError.write("unknown arg: \(args[i])\n".data(using: .utf8)!)
                 return nil
@@ -69,6 +81,10 @@ enum Watchdog {
             i += 1
         }
         guard !options.gen.isEmpty else { return nil }
+        if (options.requestDir == nil) != (options.requestUid == nil) {
+            FileHandle.standardError.write("--request-dir and --request-uid go together\n".data(using: .utf8)!)
+            return nil
+        }
         if options.closedUnlimited, !options.acOnly {
             FileHandle.standardError.write("--closed-unlimited requires --ac-only\n".data(using: .utf8)!)
             return nil
@@ -79,7 +95,7 @@ enum Watchdog {
     static func main(_ rawArgs: [String]) -> Int32 {
         guard let options = parse(rawArgs) else {
             FileHandle.standardError.write(
-                "usage: lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed] [--gui-pid PID] [--pidfile PATH] [--ac-only [--closed-unlimited]] [--daemonize]\n"
+                "usage: lidguard --watchdog --gen N --closed-until EPOCH [--sleepnow-if-closed] [--gui-pid PID] [--pidfile PATH] [--ac-only [--closed-unlimited]] [--daemonize] [--request-dir DIR --request-uid UID]\n"
                     .data(using: .utf8)!)
             return 2
         }
@@ -128,6 +144,8 @@ enum Watchdog {
 
 struct WatchdogLoop {
     let options: WatchdogOptions
+    /// Current deadline. Starts at --closed-until; a request file can move it.
+    var closedUntil: Int
     var sleepDisabled = false
     var lastLid: LidState = .unknown
     var lastPhase = ""
@@ -137,6 +155,34 @@ struct WatchdogLoop {
 
     init(options: WatchdogOptions) {
         self.options = options
+        self.closedUntil = options.closedUntil
+    }
+
+    var stopPath: String? { options.requestDir.map { "\($0)/\(RequestFiles.stop)" } }
+    var requestUntilPath: String? { options.requestDir.map { "\($0)/\(RequestFiles.closedUntil)" } }
+
+    func stopRequested() -> Bool {
+        guard let path = stopPath, let uid = options.requestUid else { return false }
+        return readUserRequest(path, uid: uid, dir: options.requestDir!) != nil
+    }
+
+    /// A new deadline from the user, applied once and clamped to [now+1m, now+6h].
+    /// 무한 has no deadline, so requests are dropped there.
+    mutating func applyDeadlineRequest(_ now: Int) {
+        guard let path = requestUntilPath, let uid = options.requestUid,
+              let raw = readUserRequest(path, uid: uid, dir: options.requestDir!) else { return }
+        unlink(path)
+        guard let requested = Int(raw), requested > 0 else {
+            log("request ignored: bad value")
+            return
+        }
+        if options.closedUnlimited {
+            log("request ignored: unlimited session has no deadline")
+            return
+        }
+        let clamped = min(max(requested, now + Watchdog.minRequestSeconds), now + Watchdog.maxRequestSeconds)
+        log("request closed_until \(closedUntil) -> \(clamped)\(clamped != requested ? " (clamped from \(requested))" : "")")
+        closedUntil = clamped
     }
 
     func log(_ message: String) {
@@ -161,7 +207,7 @@ struct WatchdogLoop {
     }
 
     func closedActive(_ now: Int) -> Bool {
-        options.closedUnlimited || (options.closedUntil > 0 && now < options.closedUntil)
+        options.closedUnlimited || (closedUntil > 0 && now < closedUntil)
     }
 
     /// Timed closed-lid stays awake on battery so Wi-Fi survives the lid closing.
@@ -174,7 +220,7 @@ struct WatchdogLoop {
     func pollWait(_ now: Int) -> Int {
         options.closedUnlimited
             ? Watchdog.pollSeconds
-            : max(0, min(Watchdog.pollSeconds, options.closedUntil - now))
+            : max(0, min(Watchdog.pollSeconds, closedUntil - now))
     }
 
     func pause(_ now: Int) {
@@ -205,20 +251,19 @@ struct WatchdogLoop {
     }
 
     mutating func revert(_ reason: String) {
-        log("revert: \(reason) gen=\(options.gen) closed_until=\(options.closedUntil)")
+        log("revert: \(reason) gen=\(options.gen) closed_until=\(closedUntil)")
         if stale() {
             log("skip revert, gen changed")
             return
         }
-        // GUI reads this to tell 시간 종료 / 과열 / 해제 apart. 666 so a later
-        // non-root process can overwrite a file a root watchdog created.
+        // GUI reads this to tell 시간 종료 / 과열 / 해제 apart. Only root writes it.
         writeText(Watchdog.lastRevertPath, "\(nowEpoch()) \(reason)\n")
-        chmod(Watchdog.lastRevertPath, 0o666)
-        if sleepDisabled || options.closedUntil > 0 || options.closedUnlimited {
+        chmod(Watchdog.lastRevertPath, 0o644)
+        if sleepDisabled || closedUntil > 0 || options.closedUnlimited {
             clearDisableSleep()
         }
-        unlink(Watchdog.untilPath)
         unlink(Watchdog.heartbeatPath)
+        if let path = requestUntilPath { unlink(path) }
         if let pidfile = options.pidfile { unlink(pidfile) }
         let lid = readLidState()
         // A confirmed open lid must never trigger sleepnow.
@@ -234,7 +279,7 @@ struct WatchdogLoop {
         writeText(Watchdog.heartbeatPath, "\(now)\n")
         writeText(Watchdog.uiStatePath, """
         heartbeat=\(now)
-        closed_until=\(options.closedUntil)
+        closed_until=\(closedUntil)
         closed_unlimited=\(options.closedUnlimited ? 1 : 0)
         ac_only=\(options.acOnly ? 1 : 0)
         lid=\(lid.rawValue)
@@ -249,7 +294,7 @@ struct WatchdogLoop {
     }
 
     mutating func run() -> Int32 {
-        log("start gen=\(options.gen) closed_until=\(options.closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") ac_only=\(options.acOnly) unlimited=\(options.closedUnlimited) poll=\(Watchdog.pollSeconds)")
+        log("start gen=\(options.gen) closed_until=\(closedUntil) gui_pid=\(options.guiPid.map(String.init) ?? "-") ac_only=\(options.acOnly) unlimited=\(options.closedUnlimited) poll=\(Watchdog.pollSeconds)")
         if closedActive(nowEpoch()), holdsClosedSleep(onAC: onACPower()) {
             setDisableSleep()
         }
@@ -259,7 +304,8 @@ struct WatchdogLoop {
                 return 0
             }
             // Stop file first. Bumping gen during 해제 must not skip revert.
-            if access(Watchdog.stopPath, F_OK) == 0 {
+            if stopRequested() {
+                // The GUI removes the request after it has ended its own timers too.
                 revert("stop-file")
                 return 0
             }
@@ -268,6 +314,11 @@ struct WatchdogLoop {
                 return 0
             }
             let now = nowEpoch()
+            let before = closedUntil
+            applyDeadlineRequest(now)
+            if closedUntil != before {
+                heartbeat(now, lid: lastLid, phase: lastPhase.isEmpty ? "request" : lastPhase)
+            }
             if thermalSerious() {
                 revert("thermal \(thermalLabel())")
                 return 0
@@ -347,3 +398,4 @@ struct WatchdogLoop {
         }
     }
 }
+

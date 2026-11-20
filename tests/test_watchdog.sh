@@ -12,6 +12,7 @@ if [ -z "${LIDGUARD_BIN:-}" ]; then
   LIDGUARD_BIN="$ROOT/dist/잠자기방지.app/Contents/MacOS/lidguard"
 fi
 BIN="$LIDGUARD_BIN"
+UID_ME="$(id -u)"
 
 # On failure, say where and show the watchdog log instead of exiting silently.
 trap 'rc=$?; echo "fail: line $LINENO (exit $rc)" >&2; echo "--- watchdog log" >&2; cat "$TMP/lidguard_watchdog.log" >&2 2>/dev/null; echo "--- pmset calls" >&2; cat "$TMP/pmset.log" >&2 2>/dev/null' ERR
@@ -39,13 +40,13 @@ run_wd() {
   LIDGUARD_FAKE_POWER="${LIDGUARD_FAKE_POWER:-ac}" \
   LIDGUARD_FAKE_POWER_FILE="${LIDGUARD_FAKE_POWER_FILE:-}" \
   LIDGUARD_FAKE_BATTERY_PERCENT="${LIDGUARD_FAKE_BATTERY_PERCENT:-80}" \
-  "$BIN" --watchdog "$@"
+  "$BIN" --watchdog --request-dir "$TMP" --request-uid "$UID_ME" "$@"
 }
 
 reset() {
   : >"$TMP/pmset.log"
   : >"$log"
-  rm -f "$TMP/lidguard_last_revert" "$TMP/lidguard_stop"
+  rm -f "$TMP/lidguard_last_revert" "$TMP/lidguard_stop" "$TMP/lidguard_request_until" "$TMP/lidguard_ui"
   echo 1 >"$TMP/lidguard_gen"
 }
 
@@ -150,7 +151,7 @@ reset
 # Background the binary itself (not a bash function) so $! is the watchdog pid.
 LIDGUARD_STATE_DIR="$TMP" LIDGUARD_POLL_SECONDS=1 LIDGUARD_PMSET="$fake_pmset" LIDGUARD_LOG="$log" \
   LIDGUARD_FAKE_THERMAL=nominal LIDGUARD_FAKE_CLAMSHELL=Yes \
-  "$BIN" --watchdog --gen 1 --closed-until "$(soon 60)" &
+  "$BIN" --watchdog --request-dir "$TMP" --request-uid "$UID_ME" --gen 1 --closed-until "$(soon 60)" &
 WD=$!
 sleep 1.5
 kill -TERM $WD
@@ -249,7 +250,7 @@ echo "ok closed-unlimited needs ac-only"
 reset
 LIDGUARD_STATE_DIR="$TMP" LIDGUARD_POLL_SECONDS=1 LIDGUARD_PMSET="$fake_pmset" LIDGUARD_LOG="$log" \
   LIDGUARD_FAKE_THERMAL=nominal LIDGUARD_FAKE_CLAMSHELL=Yes LIDGUARD_FAKE_POWER=ac LIDGUARD_FAKE_BATTERY_PERCENT=80 \
-  "$BIN" --watchdog --gen 1 --closed-until 0 --closed-unlimited --ac-only &
+  "$BIN" --watchdog --request-dir "$TMP" --request-uid "$UID_ME" --gen 1 --closed-until 0 --closed-unlimited --ac-only &
 WD=$!
 sleep 3
 kill -0 $WD || fail "unlimited watchdog exited early"
@@ -271,5 +272,81 @@ wait $WD || true
 grep -q "battery with lid closed — sleepnow" "$log"
 grep -q "disablesleep 1" "$TMP/pmset.log" && fail "armed on battery"
 echo "ok closed-unlimited pauses on battery"
+
+ui_until() { sed -n 's/^closed_until=//p' "$TMP/lidguard_ui"; }
+
+# 24) a request file moves the deadline later while running, no restart
+reset
+start=$(date +%s)
+LIDGUARD_MIN_REQUEST_SECONDS=1 FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 2)" &
+WD=$!
+sleep 1; want=$(soon 4); echo "$want" >"$TMP/lidguard_request_until"
+sleep 1.5
+[ "$(ui_until)" = "$want" ] || fail "ui closed_until $(ui_until) != $want"
+[ -e "$TMP/lidguard_request_until" ] && fail "request not consumed"
+wait $WD || true
+[ $(( $(date +%s) - start )) -ge 4 ] || fail "deadline did not move"
+grep -q "request closed_until" "$log"
+grep -q "revert: open-idle" "$log"
+[ "$(grep -c "disablesleep 1" "$TMP/pmset.log")" -eq 1 ] || fail "re-armed on extend"
+echo "ok request extends deadline"
+
+# 25) a request beyond 6 hours is clamped to now+6h
+reset
+FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 30)" &
+WD=$!
+sleep 1; echo "$(soon 36000)" >"$TMP/lidguard_request_until"
+sleep 1.5
+cap=$(( $(date +%s) + 21600 ))
+u=$(ui_until)
+[ "$u" -le "$cap" ] && [ "$u" -ge $(( cap - 5 )) ] || fail "not clamped to 6h: $u vs $cap"
+grep -q "clamped from" "$log"
+touch "$TMP/lidguard_stop"; wait $WD || true
+echo "ok request capped at 6 hours"
+
+# 26) shortening below the minimum is lifted to now+minimum, then ends
+reset
+start=$(date +%s)
+LIDGUARD_MIN_REQUEST_SECONDS=2 FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 60)" &
+WD=$!
+sleep 1; echo "$(date +%s)" >"$TMP/lidguard_request_until"
+wait $WD || true
+el=$(( $(date +%s) - start ))
+[ "$el" -ge 3 ] && [ "$el" -le 8 ] || fail "shortened session ran ${el}s"
+grep -q "revert: open-idle" "$log"
+echo "ok request shortens with a floor"
+
+# 27) 무한 ignores deadline requests
+reset
+FAKE_CLAMSHELL=No LIDGUARD_FAKE_POWER=ac run_wd --gen 1 --closed-until 0 --closed-unlimited --ac-only &
+WD=$!
+sleep 1; echo "$(soon 5)" >"$TMP/lidguard_request_until"
+sleep 1.5
+grep -q "request ignored: unlimited" "$log" || fail "unlimited took a deadline"
+grep -q "closed_unlimited=1" "$TMP/lidguard_ui"
+touch "$TMP/lidguard_stop"; wait $WD || true
+echo "ok unlimited ignores requests"
+
+# 28) symlinked request and stop files are refused (root must not follow links)
+reset
+echo "$(soon 3)" >"$TMP/target"
+LIDGUARD_MIN_REQUEST_SECONDS=1 FAKE_CLAMSHELL=No run_wd --gen 1 --closed-until "$(soon 3)" &
+WD=$!
+sleep 0.5
+ln -sf "$TMP/target" "$TMP/lidguard_request_until"
+ln -sf "$TMP/target" "$TMP/lidguard_stop"
+wait $WD || true
+grep -q "request closed_until" "$log" && fail "followed a symlinked request"
+grep -q "revert: stop-file" "$log" && fail "followed a symlinked stop file"
+grep -q "revert: open-idle" "$log"
+rm -f "$TMP/lidguard_request_until" "$TMP/lidguard_stop" "$TMP/target"
+echo "ok symlinks refused"
+
+# 29) request dir and uid must come together
+reset
+rc=0
+"$BIN" --watchdog --gen 1 --closed-until 0 --request-dir "$TMP" 2>/dev/null || rc=$?
+[ "$rc" -eq 2 ] || fail "request-dir without uid exited $rc"
+echo "ok request args paired"
 
 echo "ALL PASS"

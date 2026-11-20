@@ -1,4 +1,4 @@
-# 잠자기 방지 (lidguard) 1.5.5
+# 잠자기 방지 (lidguard) 1.6.0
 
 뚜껑 닫힘/열림 유지 시간을 따로 두고, 시간이 끝나면 실제로 잠자기로 돌아갑니다.
 
@@ -83,11 +83,31 @@
 - 시간을 정한 닫힘 유지는 배터리에서도 `disablesleep`을 유지합니다. 1.5.2의 `전원 연결 시만`이 그 타이머까지 풀어, 뚜껑을 닫는 즉시 잠들며 핫스팟이 끊기던 동작을 되돌렸습니다.
 - **무한**은 그대로 전원이 빠지면 멈춥니다. 배터리 5% 이하와 과열 해제도 그대로입니다.
 
+## 1.6.0 바깥에서 조회·연장·해제
+
+화면은 그대로입니다. 다른 도구(예: 음성 비서)가 비밀번호 없이 상태를 읽고, 켜진 세션의 끝나는 시각을 바꾸거나 해제할 수 있습니다.
+
+- **상태 폴더를 root 전용으로:** 감시 모드가 쓰는 파일(`lidguard_ui`, `lidguard_watchdog.pid`, `lidguard_heartbeat`, `lidguard_gen`, `lidguard_last_revert`, `lidguard_watchdog.log`)은 `/var/run/lidguard`(root:wheel 755)에 둡니다.
+  - 1.5.5까지는 `/tmp`에 있어서, 다른 프로세스가 세대 번호 파일(권한 666)을 바꾸면 감시 모드가 잠자기를 되돌리지 않고 끝날 수 있었습니다.
+  - 이제 세대 번호는 관리자 시작 스크립트가 root로만 올립니다.
+- **요청 폴더:** `~/Library/Application Support/lidguard`(사용자 소유 700)에 둡니다.
+  - `lidguard_stop`: 해제. 감시 모드와 앱이 모두 따릅니다.
+  - `lidguard_request_until`: 닫힘 유지의 새 끝 시각(epoch 초).
+  - `lidguard_request_open_until`: 열림 유지의 새 끝 시각.
+  - `lidguard_open_state`: 앱이 쓰는 열림 유지 상태(`open_running`, `open_until`, `open_unlimited`, `ac_only`, `gui_pid`).
+- **새 끝 시각의 범위:** 지금+1분에서 지금+6시간 사이로 맞춥니다. 늘리기와 줄이기 모두 됩니다. 무한 세션은 요청을 무시합니다.
+- **root가 요청 파일을 읽는 방법:** 폴더와 파일이 그 사용자 소유인지 확인하고, 심볼릭 링크는 따라가지 않으며(`O_NOFOLLOW`), 64바이트 넘는 파일은 읽지 않습니다.
+- **시작 스크립트:** `/tmp/lidguard_start.sh`로 쓰지 않고 관리자 셸에 인자로 바로 넘깁니다. 쓰고 실행하는 사이에 다른 프로그램이 파일을 바꿔치기할 틈(TOCTOU)이 없습니다.
+- **해제 때 감시 모드가 안 끝나면:** 세대 번호를 올리던 방식 대신, 관리자 권한으로 그 프로세스를 끝내고 `disablesleep 0`을 확인합니다.
+- **1.5.5 세션이 켜진 채로 업데이트하면:** 해제를 누르면 옛 `/tmp` 감시 모드에도 정지 요청을 보냅니다. 그래도 업데이트는 세션을 해제한 뒤에 하는 것을 권합니다.
+- **남은 위험:** root 감시 모드가 앱 실행 파일을 그대로 씁니다. 앱이 사용자 쓰기 가능한 폴더(`~/Applications`)에 있으면 실행 파일을 바꿔치기해 root를 얻을 수 있으니, `/Applications`에 두는 것을 권합니다.
+
 ## 개발
 
 ```bash
 bash scripts/build.sh
 bash tests/test_watchdog.sh   # 가짜 pmset·뚜껑·과열·전원으로 감시 모드 시나리오
 bash tests/test_native.sh     # 실제 Mac에서 IOKit·kill·IOPM 요청·호출 비용 확인
+bash tests/test_script.sh     # 관리자 시작 스크립트 문법·인용(관리자 권한 없이)
 bash scripts/release.sh [노트파일]   # Info.plist 버전으로 v태그 릴리스, zip + sha256 업로드
 ```
