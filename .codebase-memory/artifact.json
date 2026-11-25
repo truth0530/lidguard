@@ -1,0 +1,11 @@
+{
+    "schema_version": 1,
+    "commit": "0c14324a9a2e6d12200bac5bb1b79d519dd36e24",
+    "indexed_at": "2026-09-22T10:58:31Z",
+    "project": "Users-kwangsunglee-Projects-lidguard",
+    "nodes": 170,
+    "edges": 418,
+    "original_size": 1441792,
+    "compressed_size": 93232,
+    "compression_level": 9
+}
