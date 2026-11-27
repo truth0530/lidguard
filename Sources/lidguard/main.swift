@@ -20,6 +20,7 @@ private let legacyPidPath = "/tmp/lidguard_watchdog.pid"
 private let legacyStopPath = "/tmp/lidguard_stop"
 private let lastUpdateCheckKey = "lastUpdateCheck"
 private let acOnlyKey = "acOnly"
+private let keepDisplayOnKey = "keepDisplayOn"
 private let updateCheckInterval: TimeInterval = 24 * 60 * 60
 
 private let closedDurations: [Int] = [0, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
@@ -152,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var closedSeg: NSSegmentedControl?
     var openSeg: NSSegmentedControl?
     var acOnlyCheck: NSButton?
+    private var keepDisplayOnCheck: NSButton?
     var batteryItem: NSTextField?
     var batteryDot: NSTextField?
     var thermalItem: NSTextField?
@@ -166,6 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var closedRunning = false
     /// Open-lid timer: an in-process IOPM assertion, no helper process.
     private let openAssertion = IdleSleepAssertion()
+    private let displayAssertion = DisplaySleepAssertion()
     /// Open-lid timer is logically on; the assertion may be released while paused on battery.
     private var openRunning = false
     /// 전원 연결 중일 때만, fixed for the running session.
@@ -229,6 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        syncDisplayAssertion(endingSession: true)
         openRunning = false
         openAssertion.release()
         if closedRunning || leftoverSleepDisabled || watchdogPidAlive() {
@@ -240,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        syncDisplayAssertion(endingSession: true)
         openAssertion.release()
         endActivity()
         timer?.invalidate()
@@ -383,6 +388,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         acOnly.setContentHuggingPriority(.required, for: .horizontal)
         acOnly.setContentCompressionResistancePriority(.required, for: .horizontal)
         self.acOnlyCheck = acOnly
+        let keepDisplayOn = NSButton(checkboxWithTitle: "화면 꺼짐 방지", target: self,
+                                     action: #selector(keepDisplayOnChanged))
+        keepDisplayOn.controlSize = .small
+        keepDisplayOn.font = NSFont.systemFont(ofSize: 11)
+        keepDisplayOn.state = UserDefaults.standard.bool(forKey: keepDisplayOnKey) ? .on : .off
+        keepDisplayOn.toolTip = "‘전원 연결 시만’을 켜면 배터리에서 멈춥니다. 화면을 켜 두면 배터리가 빨리 닳습니다."
+        keepDisplayOn.setContentHuggingPriority(.required, for: .horizontal)
+        keepDisplayOn.setContentCompressionResistancePriority(.required, for: .horizontal)
+        self.keepDisplayOnCheck = keepDisplayOn
         // Status line on the left of the same row. Each item opens the macOS tool
         // that has the details, so this app keeps no lists, graphs or history.
         func statusItem(_ tip: String, _ action: @escaping () -> Void) -> LinkLabel {
@@ -420,10 +434,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let topFill = NSView()
         topFill.setContentHuggingPriority(.defaultLow, for: .horizontal)
         topFill.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let topBar = NSStackView(views: [topFill, acOnly])
+        let topBar = NSStackView(views: [topFill, keepDisplayOn, acOnly])
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
-        topBar.spacing = 0
+        topBar.spacing = 12
 
         let rule = NSBox()
         rule.boxType = .separator
@@ -522,6 +536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             leftoverSleepDisabled = true
             lastError = "이전 잠자기 방지 설정이 남아 있습니다 · 해제를 눌러 되돌리세요"
         }
+        syncDisplayAssertion()
         writeOpenState()
         updateButtons()
         updateStatusVisuals()
@@ -614,6 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 lastError = "워치독이 응답하지 않습니다 · 해제를 눌러 잠자기 설정을 되돌리세요"
             }
         }
+        syncDisplayAssertion()
         if !isSessionActive {
             endActivity()
         }
@@ -652,6 +668,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let on = acOnlyCheck?.state == .on
         UserDefaults.standard.set(on, forKey: acOnlyKey)
         closedSeg?.setLabel(on ? closedUnlimitedLabel : closedLongLabel, forSegment: closedLabels.count)
+    }
+
+    @objc private func keepDisplayOnChanged() {
+        UserDefaults.standard.set(keepDisplayOnCheck?.state == .on, forKey: keepDisplayOnKey)
+        syncDisplayAssertion()
+    }
+
+    private func syncDisplayAssertion(endingSession: Bool = false) {
+        if !endingSession, !isStopping, keepDisplayOnCheck?.state == .on,
+           closedArmed() || openArmed(), !thermalSerious(),
+           !sessionACOnly || onACPower(), !batteryLow() {
+            displayAssertion.hold(reason: "잠자기 방지: 화면 꺼짐 방지")
+        } else {
+            displayAssertion.release()
+        }
     }
 
     func openArmed() -> Bool {
@@ -785,6 +816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard closedSeconds != 0 else {
             startOpen(openSeconds)
+            syncDisplayAssertion()
             updateButtons()
             updateStatusVisuals()
             return
@@ -804,6 +836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.closedUnlimited = closedSeconds < 0
                     self.closedUntil = closedSeconds > 0 ? nowEpoch() + closedSeconds : nil
                     self.startOpen(openSeconds)
+                    self.syncDisplayAssertion()
                     self.beginActivity()
                 } else {
                     self.lastError = result.1
@@ -853,6 +886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func stopPressed() {
         guard !isStopping else { return }
         isStopping = true
+        syncDisplayAssertion()
         lastError = nil
         openRunning = false
         openAssertion.release()

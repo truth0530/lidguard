@@ -30,6 +30,19 @@ assertion.release()
 let gone = !runTool("/usr/bin/pmset", ["-g", "assertions"]).output.contains("lidguard test")
 check("assertion released", gone && !assertion.isHeld)
 
+let displayAssertion = DisplaySleepAssertion()
+let displayReason = "lidguard display test \(getpid())"
+check("IOPM display assertion hold", displayAssertion.hold(reason: displayReason) && displayAssertion.isHeld)
+let displayHeld = runTool("/usr/bin/pmset", ["-g", "assertions"])
+check("PreventUserIdleDisplaySleep visible in pmset -g assertions", displayHeld.status == 0
+      && displayHeld.output.split(separator: "\n").contains {
+          $0.contains("PreventUserIdleDisplaySleep") && $0.contains("\"\(displayReason)\"")
+      })
+displayAssertion.release()
+let displayReleased = runTool("/usr/bin/pmset", ["-g", "assertions"])
+check("display assertion released", displayReleased.status == 0
+      && !displayReleased.output.contains("\"\(displayReason)\"") && !displayAssertion.isHeld)
+
 check("version compare", isVersion("1.5.1", newerThan: "1.5.0") && !isVersion("1.5.0", newerThan: "1.5")
       && isVersion("v1.10.0", newerThan: "1.9.9"))
 

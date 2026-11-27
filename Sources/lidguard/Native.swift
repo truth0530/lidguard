@@ -202,3 +202,32 @@ final class IdleSleepAssertion {
         isHeld = false
     }
 }
+
+/// macOS drops this display assertion when the process exits or crashes.
+final class DisplaySleepAssertion {
+    private var id: IOPMAssertionID = 0
+    private(set) var isHeld = false
+
+    @discardableResult
+    func hold(reason: String) -> Bool {
+        guard !isHeld else { return true }
+        var newID: IOPMAssertionID = 0
+        let result = IOPMAssertionCreateWithName(
+            "PreventUserIdleDisplaySleep" as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason as CFString,
+            &newID
+        )
+        guard result == kIOReturnSuccess else { return false }
+        id = newID
+        isHeld = true
+        return true
+    }
+
+    func release() {
+        guard isHeld else { return }
+        IOPMAssertionRelease(id)
+        id = 0
+        isHeld = false
+    }
+}
